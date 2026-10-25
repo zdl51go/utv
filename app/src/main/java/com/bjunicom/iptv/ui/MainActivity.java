@@ -79,6 +79,7 @@ public class MainActivity extends AppCompatActivity {
     private TextView tvOsdGroupName;
     private TextView tvOsdStreamUrl;
     private TextView tvOsdTrackInfo;
+    private Button btnSwitchIsp;
     private Button btnFavoriteChannel;
     private Button btnPrevChannel;
     private View[] hudButtons;
@@ -184,6 +185,7 @@ public class MainActivity extends AppCompatActivity {
         tvOsdGroupName = findViewById(R.id.tv_osd_group_name);
         tvOsdStreamUrl = findViewById(R.id.tv_osd_stream_url);
         tvOsdTrackInfo = findViewById(R.id.tv_osd_track_info);
+        btnSwitchIsp = findViewById(R.id.btn_switch_isp);
         btnFavoriteChannel = findViewById(R.id.btn_favorite_channel);
         btnPrevChannel = findViewById(R.id.btn_prev_channel);
 
@@ -219,6 +221,7 @@ public class MainActivity extends AppCompatActivity {
         findViewById(R.id.btn_open_scanner).setOnClickListener(v -> openScannerActivity());
 
         findViewById(R.id.btn_open_settings).setOnClickListener(v -> showSettingsDialog());
+        btnSwitchIsp.setOnClickListener(v -> showIspSwitchDialog());
 
         btnPrevChannel.setOnClickListener(v -> switchAdjacentChannel(-1));
         findViewById(R.id.btn_next_channel).setOnClickListener(v -> switchAdjacentChannel(1));
@@ -236,6 +239,7 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        updateIspButtonsVisualState();
         setupButtonFocusEffects();
     }
 
@@ -243,6 +247,7 @@ public class MainActivity extends AppCompatActivity {
         hudButtons = new View[]{
                 findViewById(R.id.btn_toggle_drawer),
                 findViewById(R.id.btn_open_scanner),
+                findViewById(R.id.btn_switch_isp),
                 findViewById(R.id.btn_open_settings),
                 findViewById(R.id.btn_prev_channel),
                 findViewById(R.id.btn_next_channel),
@@ -1200,6 +1205,58 @@ public class MainActivity extends AppCompatActivity {
                 })
                 .setNegativeButton("取消", null)
                 .show();
+    }
+
+    private void updateIspButtonsVisualState() {
+        if (btnSwitchIsp != null && settings != null) {
+            btnSwitchIsp.setText(settings.getIspShortName());
+        }
+    }
+
+    private void showIspSwitchDialog() {
+        String[] options = {
+                "北京联通 IPTV",
+                "北京移动 IPTV",
+                "北京电信 IPTV",
+                "北京三网聚合"
+        };
+        int current = Math.min(settings.getIspProvider(), IptvSettings.ISP_ALL_MERGED);
+        new MaterialAlertDialogBuilder(this)
+                .setTitle("选择 IPTV 节目源")
+                .setSingleChoiceItems(options, current, (dialog, which) -> {
+                    dialog.dismiss();
+                    switchIspProvider(which);
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void switchIspProvider(int newIsp) {
+        int oldIsp = settings.getIspProvider();
+        if (oldIsp == newIsp) {
+            return;
+        }
+        String oldDefaultSubnet = IptvSettings.getDefaultScanSubnetForIsp(oldIsp);
+        if (oldDefaultSubnet.equals(settings.getScanSubnet())) {
+            settings.setIspProvider(newIsp);
+            settings.setScanSubnet(IptvSettings.getDefaultScanSubnetForIsp(newIsp));
+        } else {
+            settings.setIspProvider(newIsp);
+        }
+        repository.reloadChannels();
+        if (categoryAdapter != null) {
+            categoryAdapter.setCategories(repository.getCategoryGroups());
+            categoryAdapter.setSelectedCategory(ChannelRepository.GROUP_ALL);
+        }
+        updateIspButtonsVisualState();
+        refreshChannelList();
+        videoView.stopPlayback();
+        currentChannel = null;
+        List<IptvChannel> channels = repository.getAllChannels();
+        if (!channels.isEmpty()) {
+            playChannel(channels.get(0));
+        }
+        Toast.makeText(this, "已切换至: " + settings.getIspDisplayName(), Toast.LENGTH_SHORT).show();
     }
 
     /**

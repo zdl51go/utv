@@ -292,6 +292,7 @@ public class IjkVideoView extends FrameLayout {
             boolean useSeparatedPoolPipeline = (getEffectivePlayerType() == IptvSettings.PLAYER_IJK)
                     && !mForceFallbackPlayer
                     && scheme != null
+                    && !isHlsUri(playbackUri)
                     && (scheme.equalsIgnoreCase("http")
                     || scheme.equalsIgnoreCase("https")
                     || scheme.equalsIgnoreCase("rtp")
@@ -345,6 +346,14 @@ public class IjkVideoView extends FrameLayout {
             mTargetState = STATE_ERROR;
             mErrorListener.onError(mMediaPlayer, MediaPlayer.MEDIA_ERROR_UNKNOWN, 0);
         }
+    }
+
+    private boolean isHlsUri(Uri uri) {
+        if (uri == null) {
+            return false;
+        }
+        String value = uri.toString().toLowerCase(Locale.US);
+        return value.contains(".m3u8");
     }
 
     /**
