@@ -5,10 +5,16 @@ import android.content.SharedPreferences;
 import android.text.TextUtils;
 
 /**
- * 播放器与北京联通 IPTV 网络转发配置管理
+ * 播放器与北京 IPTV (联通 / 移动 / 电信) 网络转发配置管理
  */
 public class IptvSettings {
     private static final String PREF_NAME = "bj_unicom_iptv_prefs";
+
+    public static final int ISP_BEIJING_UNICOM = 0;
+    public static final int ISP_BEIJING_MOBILE = 1;
+    public static final int ISP_BEIJING_TELECOM = 2;
+    public static final int ISP_ALL_MERGED = 3;
+    public static final int ISP_CUSTOM_M3U = 4;
 
     // 流播放传输模式
     public static final int STREAM_MODE_UDPXY = 0;          // 路由器/软路由 udpxy 组播转单播 (如 http://192.168.2.1:8012/rtp/...)
@@ -21,6 +27,8 @@ public class IptvSettings {
     public static final int PLAYER_IJK_EXO = 2;             // IjkExoMediaPlayer
 
     private static final String KEY_STREAM_MODE = "stream_mode";
+    private static final String KEY_ISP_PROVIDER = "isp_provider";
+    private static final String KEY_CUSTOM_M3U_NAME = "custom_m3u_name";
     private static final String KEY_UDPXY_ADDR = "udpxy_addr";
     private static final String KEY_PLAYER_TYPE = "player_type";
     private static final String KEY_MEDIACODEC_ENABLED = "mediacodec_enabled";
@@ -41,6 +49,70 @@ public class IptvSettings {
 
     public IptvSettings(Context context) {
         this.prefs = context.getApplicationContext().getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
+    }
+
+    public int getIspProvider() {
+        return prefs.getInt(KEY_ISP_PROVIDER, ISP_BEIJING_UNICOM);
+    }
+
+    public void setIspProvider(int ispProvider) {
+        if (ispProvider < ISP_BEIJING_UNICOM || ispProvider > ISP_CUSTOM_M3U) {
+            ispProvider = ISP_BEIJING_UNICOM;
+        }
+        prefs.edit().putInt(KEY_ISP_PROVIDER, ispProvider).apply();
+    }
+
+    public String getCustomM3uName() {
+        String name = prefs.getString(KEY_CUSTOM_M3U_NAME, "");
+        return TextUtils.isEmpty(name) ? "custom.m3u" : name.trim();
+    }
+
+    public void setCustomM3uName(String fileName) {
+        prefs.edit().putString(KEY_CUSTOM_M3U_NAME,
+                fileName != null ? fileName.trim() : "custom.m3u").apply();
+    }
+
+    public String getIspDisplayName() {
+        if (getIspProvider() == ISP_CUSTOM_M3U) {
+            return "自定义 M3U (" + getCustomM3uName() + ")";
+        }
+        return getIspDisplayName(getIspProvider());
+    }
+
+    public static String getIspDisplayName(int ispProvider) {
+        switch (ispProvider) {
+            case ISP_BEIJING_MOBILE:
+                return "北京移动 IPTV";
+            case ISP_BEIJING_TELECOM:
+                return "北京电信 IPTV";
+            case ISP_ALL_MERGED:
+                return "北京三网聚合";
+            case ISP_CUSTOM_M3U:
+                return "自定义 M3U";
+            case ISP_BEIJING_UNICOM:
+            default:
+                return "北京联通 IPTV";
+        }
+    }
+
+    public String getIspShortName() {
+        switch (getIspProvider()) {
+            case ISP_BEIJING_MOBILE:
+                return "北京移动";
+            case ISP_BEIJING_TELECOM:
+                return "北京电信";
+            case ISP_ALL_MERGED:
+                return "三网聚合";
+            case ISP_CUSTOM_M3U:
+                return "自定义源";
+            case ISP_BEIJING_UNICOM:
+            default:
+                return "北京联通";
+        }
+    }
+
+    public static String getDefaultScanSubnetForIsp(int ispProvider) {
+        return ispProvider == ISP_BEIJING_TELECOM ? "225.1.8" : "239.3.1";
     }
 
     public int getStreamMode() {
@@ -131,19 +203,28 @@ public class IptvSettings {
     }
 
     public String getLastChannelUrl() {
-        return prefs.getString(KEY_LAST_CHANNEL_URL, "rtp://239.3.1.129:8008");
+        int isp = getIspProvider();
+        if (isp == ISP_BEIJING_UNICOM) {
+            return prefs.getString(KEY_LAST_CHANNEL_URL, "rtp://239.3.1.129:8008");
+        }
+        String defaultUrl = isp == ISP_BEIJING_TELECOM ? "rtp://225.1.8.1:8008" : "";
+        return prefs.getString(KEY_LAST_CHANNEL_URL + "_" + isp, defaultUrl);
     }
 
     public void setLastChannelUrl(String url) {
-        prefs.edit().putString(KEY_LAST_CHANNEL_URL, url).apply();
+        int isp = getIspProvider();
+        String key = isp == ISP_BEIJING_UNICOM ? KEY_LAST_CHANNEL_URL : KEY_LAST_CHANNEL_URL + "_" + isp;
+        prefs.edit().putString(key, url).apply();
     }
 
     public String getScanSubnet() {
-        return prefs.getString(KEY_SCAN_SUBNET, "239.3.1");
+        String saved = prefs.getString(KEY_SCAN_SUBNET, "");
+        return TextUtils.isEmpty(saved) ? getDefaultScanSubnetForIsp(getIspProvider()) : saved;
     }
 
     public void setScanSubnet(String subnet) {
-        prefs.edit().putString(KEY_SCAN_SUBNET, subnet != null ? subnet.trim() : "239.3.1").apply();
+        String fallback = getDefaultScanSubnetForIsp(getIspProvider());
+        prefs.edit().putString(KEY_SCAN_SUBNET, subnet != null ? subnet.trim() : fallback).apply();
     }
 
     public int getScanStartHost() {
