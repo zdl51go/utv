@@ -26,17 +26,27 @@ import java.util.Set;
 /**
  * 频道数据仓库
  * 负责管理：
- * 1. 内置北京联通 IPTV 频道列表 (bj-unicom-iptv.m3u / bj-unicom-iptv-all.m3u)
- * 2. 动态扫描与 check_iptv_m3u.sh 生成的 modified_iptv.m3u 合并及持久化
+ * 1. 内置北京联通 / 北京移动 / 北京电信 IPTV 频道列表，可按运营商或三网聚合加载
+ * 2. 动态扫描与 check_iptv_m3u.sh 生成的 modified_iptv*.m3u 合并及持久化
  * 3. 分组索引 ([高清]央视, [高清]卫视, [高清]北京, [高清]北京IPTV, 4K, 少儿, 标清, 动态扫描发现, 收藏)
  */
 public class ChannelRepository {
-    private static final String ASSET_M3U_LATEST = "bj-unicom-iptv.m3u";
-    private static final String ASSET_M3U_ALL = "bj-unicom-iptv-all.m3u";
-    private static final String CUSTOM_SCANNED_M3U = "modified_iptv.m3u";
+    public static final String ASSET_UNICOM_LATEST = "bj-unicom-iptv.m3u";
+    public static final String ASSET_UNICOM_ALL = "bj-unicom-iptv-all.m3u";
+    public static final String ASSET_MOBILE_LATEST = "bj-mobile-iptv.m3u";
+    public static final String ASSET_MOBILE_ALL = "bj-mobile-iptv-all.m3u";
+    public static final String ASSET_TELECOM_ALL = "bj-telecom-iptv.m3u";
+
+    private static final String CUSTOM_SCANNED_M3U_UNICOM = "modified_iptv.m3u";
+    private static final String CUSTOM_SCANNED_M3U_MOBILE = "modified_iptv_mobile.m3u";
+    private static final String CUSTOM_SCANNED_M3U_TELECOM = "modified_iptv_telecom.m3u";
+    private static final String CUSTOM_SCANNED_M3U_ALL = "modified_iptv_all.m3u";
     public static final String CUSTOM_UPLOADED_M3U_FILE = "custom_uploaded_iptv.m3u";
 
     public static final String GROUP_ALL = "全部频道";
+    public static final String GROUP_ISP_UNICOM = "北京联通";
+    public static final String GROUP_ISP_MOBILE = "北京移动";
+    public static final String GROUP_ISP_TELECOM = "北京电信";
     public static final String GROUP_FAVORITES = "收藏频道";
     public static final String GROUP_4K = "4K";
     public static final String GROUP_HD_CCTV = "[高清]央视";
@@ -76,8 +86,26 @@ public class ChannelRepository {
         allChannels.clear();
         knownMulticastMap.clear();
 
-        String assetName = settings.isIncludeAllRepoChannels() ? ASSET_M3U_ALL : ASSET_M3U_LATEST;
-        List<IptvChannel> baseList = loadFromAssets(assetName);
+        int ispProvider = settings.getIspProvider();
+        boolean includeAll = settings.isIncludeAllRepoChannels();
+        List<IptvChannel> baseList = new ArrayList<>();
+        if (ispProvider == IptvSettings.ISP_CUSTOM_M3U && hasCustomUploadedM3u()) {
+            baseList.addAll(loadFromFileWithIsp(getCustomUploadedM3uFile(), "自定义源", false));
+        } else if (ispProvider == IptvSettings.ISP_BEIJING_MOBILE) {
+            baseList.addAll(loadFromAssetsWithIsp(
+                    includeAll ? ASSET_MOBILE_ALL : ASSET_MOBILE_LATEST, GROUP_ISP_MOBILE, false));
+        } else if (ispProvider == IptvSettings.ISP_BEIJING_TELECOM) {
+            baseList.addAll(loadFromAssetsWithIsp(ASSET_TELECOM_ALL, GROUP_ISP_TELECOM, false));
+        } else if (ispProvider == IptvSettings.ISP_ALL_MERGED) {
+            baseList.addAll(loadFromAssetsWithIsp(
+                    includeAll ? ASSET_UNICOM_ALL : ASSET_UNICOM_LATEST, GROUP_ISP_UNICOM, true));
+            baseList.addAll(loadFromAssetsWithIsp(
+                    includeAll ? ASSET_MOBILE_ALL : ASSET_MOBILE_LATEST, GROUP_ISP_MOBILE, true));
+            baseList.addAll(loadFromAssetsWithIsp(ASSET_TELECOM_ALL, GROUP_ISP_TELECOM, true));
+        } else {
+            baseList.addAll(loadFromAssetsWithIsp(
+                    includeAll ? ASSET_UNICOM_ALL : ASSET_UNICOM_LATEST, GROUP_ISP_UNICOM, false));
+        }
         Set<String> favorites = settings.getFavoriteUrls();
 
         int idx = 1;
@@ -91,16 +119,19 @@ public class ChannelRepository {
         }
 
         // 同时加载全量字典以便扫描器识别历史频道名称
-        if (!ASSET_M3U_ALL.equals(assetName)) {
-            for (IptvChannel ch : loadFromAssets(ASSET_M3U_ALL)) {
-                if (!TextUtils.isEmpty(ch.getMulticastKey()) && !knownMulticastMap.containsKey(ch.getMulticastKey())) {
-                    knownMulticastMap.put(ch.getMulticastKey(), ch);
-                }
+        for (IptvChannel ch : loadFromAssetsWithIsp(ASSET_UNICOM_ALL, GROUP_ISP_UNICOM, false)) {
+            if (!TextUtils.isEmpty(ch.getMulticastKey()) && !knownMulticastMap.containsKey(ch.getMulticastKey())) {
+                knownMulticastMap.put(ch.getMulticastKey(), ch);
+            }
+        }
+        for (IptvChannel ch : loadFromAssetsWithIsp(ASSET_TELECOM_ALL, GROUP_ISP_TELECOM, false)) {
+            if (!TextUtils.isEmpty(ch.getMulticastKey()) && !knownMulticastMap.containsKey(ch.getMulticastKey())) {
+                knownMulticastMap.put(ch.getMulticastKey(), ch);
             }
         }
 
         // 如果存在动态扫描保存的 modified_iptv.m3u，合并检测状态与新发现的组播地址
-        File scannedFile = new File(getScanRootDir(), CUSTOM_SCANNED_M3U);
+        File scannedFile = new File(getScanRootDir(), getCustomScannedFileName());
         if (scannedFile.exists()) {
             mergeFromModifiedM3u(scannedFile);
         }
@@ -111,6 +142,57 @@ public class ChannelRepository {
             return M3uParser.parse(is);
         } catch (IOException e) {
             return new ArrayList<>();
+        }
+    }
+
+    private List<IptvChannel> loadFromAssetsWithIsp(String fileName, String ispName, boolean appendIspToDisplay) {
+        List<IptvChannel> list = loadFromAssets(fileName);
+        annotateIsp(list, ispName, appendIspToDisplay);
+        return list;
+    }
+
+    private List<IptvChannel> loadFromFileWithIsp(File file, String ispName, boolean appendIspToDisplay) {
+        if (file == null || !file.exists()) {
+            return new ArrayList<>();
+        }
+        try (InputStream is = new FileInputStream(file)) {
+            List<IptvChannel> list = M3uParser.parse(is);
+            annotateIsp(list, ispName, appendIspToDisplay);
+            return list;
+        } catch (IOException e) {
+            return new ArrayList<>();
+        }
+    }
+
+    private void annotateIsp(List<IptvChannel> channels, String ispName, boolean appendIspToDisplay) {
+        for (IptvChannel channel : channels) {
+            channel.setIspName(ispName);
+            List<String> groups = new ArrayList<>(channel.getGroups());
+            if (!TextUtils.isEmpty(ispName) && !groups.contains(ispName)) {
+                groups.add(ispName);
+                channel.setGroups(groups);
+            }
+            if (appendIspToDisplay && !TextUtils.isEmpty(ispName)) {
+                String shortName = ispName.replace("北京", "");
+                String displayName = channel.getDisplayName();
+                if (!TextUtils.isEmpty(displayName) && !displayName.contains("(" + shortName + ")")) {
+                    channel.setDisplayName(displayName + " (" + shortName + ")");
+                }
+            }
+        }
+    }
+
+    private String getCustomScannedFileName() {
+        switch (settings.getIspProvider()) {
+            case IptvSettings.ISP_BEIJING_MOBILE:
+                return CUSTOM_SCANNED_M3U_MOBILE;
+            case IptvSettings.ISP_BEIJING_TELECOM:
+                return CUSTOM_SCANNED_M3U_TELECOM;
+            case IptvSettings.ISP_ALL_MERGED:
+                return CUSTOM_SCANNED_M3U_ALL;
+            case IptvSettings.ISP_BEIJING_UNICOM:
+            default:
+                return CUSTOM_SCANNED_M3U_UNICOM;
         }
     }
 
@@ -169,6 +251,9 @@ public class ChannelRepository {
                 // 新扫描发现的组播地址
                 scanned.setIndex(allChannels.size() + 1);
                 scanned.setDiscoveredByScan(true);
+                if (TextUtils.isEmpty(scanned.getIspName())) {
+                    scanned.setIspName(ispNameForCurrentProvider());
+                }
                 if (scanned.getConnected() == null) {
                     scanned.setConnected(true);
                 }
@@ -191,7 +276,7 @@ public class ChannelRepository {
 
     public synchronized void saveModifiedM3u(List<IptvChannel> channels) {
         try {
-            File outFile = new File(getScanRootDir(), CUSTOM_SCANNED_M3U);
+            File outFile = new File(getScanRootDir(), getCustomScannedFileName());
             String m3uContent = M3uParser.toM3uContent(channels, true, null);
             try (FileOutputStream fos = new FileOutputStream(outFile)) {
                 fos.write(m3uContent.getBytes(StandardCharsets.UTF_8));
@@ -333,6 +418,11 @@ public class ChannelRepository {
     public synchronized List<String> getCategoryGroups() {
         List<String> categories = new ArrayList<>();
         categories.add(GROUP_ALL);
+        if (settings.getIspProvider() == IptvSettings.ISP_ALL_MERGED) {
+            categories.add(GROUP_ISP_UNICOM);
+            categories.add(GROUP_ISP_MOBILE);
+            categories.add(GROUP_ISP_TELECOM);
+        }
         categories.add(GROUP_HD_CCTV);
         categories.add(GROUP_HD_SATELLITE);
         categories.add(GROUP_HD_BJ);
@@ -343,6 +433,22 @@ public class ChannelRepository {
         categories.add(GROUP_DISCOVERED);
         categories.add(GROUP_FAVORITES);
         return categories;
+    }
+
+    private String ispNameForCurrentProvider() {
+        switch (settings.getIspProvider()) {
+            case IptvSettings.ISP_BEIJING_MOBILE:
+                return GROUP_ISP_MOBILE;
+            case IptvSettings.ISP_BEIJING_TELECOM:
+                return GROUP_ISP_TELECOM;
+            case IptvSettings.ISP_ALL_MERGED:
+                return "";
+            case IptvSettings.ISP_CUSTOM_M3U:
+                return "自定义源";
+            case IptvSettings.ISP_BEIJING_UNICOM:
+            default:
+                return GROUP_ISP_UNICOM;
+        }
     }
 
     public synchronized List<IptvChannel> filterChannels(String category, String searchQuery, boolean onlyAvailable) {
@@ -373,6 +479,9 @@ public class ChannelRepository {
 
     private boolean matchesCategory(IptvChannel ch, String category) {
         if (TextUtils.isEmpty(category) || GROUP_ALL.equals(category)) {
+            return true;
+        }
+        if (category.equals(ch.getIspName())) {
             return true;
         }
         if (GROUP_FAVORITES.equals(category)) {
