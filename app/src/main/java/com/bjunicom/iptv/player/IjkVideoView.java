@@ -889,7 +889,14 @@ public class IjkVideoView extends FrameLayout {
             } catch (Throwable ignored) {
             }
             checkAndStartHwAudioIfNeeded();
-            checkHevcHardwareDecodeFailure(mp);
+            // A failed hardware probe tears down the current session and either
+            // retries with a fresh decoder or asks the host to switch players.
+            // Do not continue this stale onPrepared callback after that teardown:
+            // it could mark the failed channel connected and start the replacement
+            // player re-entrantly.
+            if (checkHevcHardwareDecodeFailure(mp)) {
+                return;
+            }
 
             mVideoWidth = mp.getVideoWidth();
             mVideoHeight = mp.getVideoHeight();
@@ -961,18 +968,18 @@ public class IjkVideoView extends FrameLayout {
      * ijk 会无提示回退 avcodec 软解，4K@50fps 软解帧率仅个位数且无任何报错，
      * 必须在 onPrepared 后主动检查解码器实现并回调外部切换播放内核。
      */
-    private void checkHevcHardwareDecodeFailure(IMediaPlayer mp) {
+    private boolean checkHevcHardwareDecodeFailure(IMediaPlayer mp) {
         if (mOnHevcSoftwareDecodeListener == null || mForceFallbackPlayer) {
-            return;
+            return false;
         }
         if (mPooledIjkDecoder == null || mActiveCodecDescriptor == null
                 || !mActiveCodecDescriptor.isHevc()) {
-            return;
+            return false;
         }
         if (mSettings.getPlayerType() != IptvSettings.PLAYER_IJK
                 || !mSettings.isMediaCodecEnabled()
                 || !mSettings.isMediaCodecHevcEnabled()) {
-            return;
+            return false;
         }
         try {
             IMediaPlayer raw = unwrapIjkMediaPlayer();
@@ -981,15 +988,33 @@ public class IjkVideoView extends FrameLayout {
                 if (vdec != IjkMediaPlayer.FFP_PROPV_DECODER_MEDIACODEC) {
                     if (mHevcFreshRetryCount < MAX_HEVC_FRESH_RETRIES) {
                         retryHevcHardwareDecodeWithFreshInstance();
+                        return true;
                     } else {
                         Log.w(TAG, "HEVC hardware decode unavailable after " + mHevcFreshRetryCount
                                 + " fresh retries (vdec=" + vdec + "), falling back to system player");
-                        mOnHevcSoftwareDecodeListener.onHevcSoftwareDecodeDetected();
+                        // The failed IJK instance must never be returned to the
+                        // healthy decoder pool. The old code called the external
+                        // fallback callback first; MainActivity then called
+                        // setVideoURI() re-entrantly while this onPrepared callback
+                        // was still running, and release(false) recycled this
+                        // software/failed HEVC slot. That poisoned all later 4K
+                        // channels until the app process was restarted.
+                        release(false, true);
+                        final long tokenAfterTeardown = mPlaybackSessionToken.get();
+                        post(() -> {
+                            if (tokenAfterTeardown == mPlaybackSessionToken.get()
+                                    && mOnHevcSoftwareDecodeListener != null) {
+                                mOnHevcSoftwareDecodeListener.onHevcSoftwareDecodeDetected();
+                            }
+                        });
+                        return true;
                     }
                 }
             }
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            Log.w(TAG, "Unable to inspect HEVC decoder state", t);
         }
+        return false;
     }
 
     /**
