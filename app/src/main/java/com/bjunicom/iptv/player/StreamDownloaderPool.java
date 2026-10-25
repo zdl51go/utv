@@ -5,6 +5,7 @@ import android.text.TextUtils;
 import android.util.Log;
 
 import com.bjunicom.iptv.network.LocalMulticastProxyServer;
+import com.bjunicom.iptv.network.RtpTsPacketParser;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -215,6 +216,20 @@ public class StreamDownloaderPool {
             currentSpeedBytesPerSec = 0L;
             bytesInCurrentWindow = 0L;
             speedWindowStartMs = System.currentTimeMillis();
+        }
+
+        private void resetStartupAlignmentOnPacketLoss() {
+            if (!keyframeAligned) {
+                hasPat = false;
+                hasPmt = false;
+                pmtPid = -1;
+                videoPid = -1;
+                audioPid = -1;
+                audioAligned = false;
+                firstVideoPts = -1L;
+                codecNotified = false;
+                currentDescriptor = null;
+            }
         }
 
         public void setAudioTeeListener(TsPacketTeeListener listener) {
@@ -469,6 +484,7 @@ public class StreamDownloaderPool {
 
                 byte[] udpBuf = new byte[2048];
                 DatagramPacket packet = new DatagramPacket(udpBuf, udpBuf.length);
+                RtpTsPacketParser payloadParser = new RtpTsPacketParser();
 
                 long joinTimeMs = System.currentTimeMillis();
                 boolean receivedAnyPacket = false;
@@ -476,6 +492,7 @@ public class StreamDownloaderPool {
 
                 while (isTokenValid(token)) {
                     try {
+                        packet.setLength(udpBuf.length);
                         socket.receive(packet);
                     } catch (java.net.SocketTimeoutException timeoutEx) {
                         // 组播接收超时处理：
@@ -506,34 +523,17 @@ public class StreamDownloaderPool {
                     }
                     recordDownloadedBytes(len);
 
-                    // 自动剥离 12 字节 RTP 协议头（含 CSRC 与扩展头）
-                    int payloadOffset = offset;
-                    int payloadLen = len;
-                    if ((udpBuf[offset] & 0xFF) != 0x47 && len > 12) {
-                        int version = (udpBuf[offset] & 0xC0) >>> 6;
-                        if (version == 2) {
-                            int csrcCount = udpBuf[offset] & 0x0F;
-                            boolean hasExt = (udpBuf[offset] & 0x10) != 0;
-                            boolean hasPad = (udpBuf[offset] & 0x20) != 0;
-                            int hdrLen = 12 + csrcCount * 4;
-                            if (hasExt && len >= hdrLen + 4) {
-                                int extWords = ((udpBuf[offset + hdrLen + 2] & 0xFF) << 8)
-                                        | (udpBuf[offset + hdrLen + 3] & 0xFF);
-                                hdrLen += 4 + extWords * 4;
-                            }
-                            int padBytes = hasPad ? (udpBuf[offset + len - 1] & 0xFF) : 0;
-                            if (hdrLen + padBytes < len) {
-                                payloadOffset = offset + hdrLen;
-                                payloadLen = len - hdrLen - padBytes;
-                            }
-                        }
+                    RtpTsPacketParser.Payload payload = payloadParser.parse(udpBuf, len);
+                    if (payload == null) {
+                        continue;
                     }
-
-                    int end = payloadOffset + payloadLen;
-                    for (int pos = payloadOffset; pos + 188 <= end && isTokenValid(token); pos += 188) {
-                        if ((udpBuf[pos] & 0xFF) == 0x47) {
-                            onAlignedTsPacket(token, udpBuf, pos, listener);
-                        }
+                    if (payload.discontinuity) {
+                        // A lost RTP packet invalidates any partial startup alignment.
+                        resetStartupAlignmentOnPacketLoss();
+                    }
+                    int end = payload.offset + payload.length;
+                    for (int pos = payload.offset; pos + 188 <= end && isTokenValid(token); pos += 188) {
+                        onAlignedTsPacket(token, udpBuf, pos, listener);
                     }
                 }
             } catch (Exception e) {

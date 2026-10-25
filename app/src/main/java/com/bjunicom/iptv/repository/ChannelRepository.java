@@ -13,8 +13,10 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -32,6 +34,7 @@ public class ChannelRepository {
     private static final String ASSET_M3U_LATEST = "bj-unicom-iptv.m3u";
     private static final String ASSET_M3U_ALL = "bj-unicom-iptv-all.m3u";
     private static final String CUSTOM_SCANNED_M3U = "modified_iptv.m3u";
+    public static final String CUSTOM_UPLOADED_M3U_FILE = "custom_uploaded_iptv.m3u";
 
     public static final String GROUP_ALL = "全部频道";
     public static final String GROUP_FAVORITES = "收藏频道";
@@ -50,6 +53,7 @@ public class ChannelRepository {
     private final IptvSettings settings;
     private final List<IptvChannel> allChannels = new ArrayList<>();
     private final Map<String, IptvChannel> knownMulticastMap = new LinkedHashMap<>();
+    private volatile File lastSavedLocalM3uFile;
 
     private ChannelRepository(Context context) {
         this.appContext = context.getApplicationContext();
@@ -194,6 +198,103 @@ public class ChannelRepository {
             }
         } catch (IOException ignored) {
         }
+    }
+
+    public File getCustomUploadedM3uFile() {
+        return new File(getScanRootDir(), CUSTOM_UPLOADED_M3U_FILE);
+    }
+
+    public boolean hasCustomUploadedM3u() {
+        File file = getCustomUploadedM3uFile();
+        return file.exists() && file.length() > 0;
+    }
+
+    public String readCustomUploadedM3uContent() {
+        File file = getCustomUploadedM3uFile();
+        if (!file.exists() || file.length() > Integer.MAX_VALUE) {
+            return "";
+        }
+        try (InputStream is = new FileInputStream(file)) {
+            byte[] bytes = new byte[(int) file.length()];
+            int read = is.read(bytes);
+            return read > 0 ? new String(bytes, 0, read, StandardCharsets.UTF_8) : "";
+        } catch (IOException ignored) {
+            return "";
+        }
+    }
+
+    /** Parse, validate and persist a custom M3U, then merge its channels into the current list. */
+    public synchronized M3uParser.M3uInspectionReport importCustomM3uContent(
+            String content, String sourceName) {
+        M3uParser.M3uInspectionReport report = M3uParser.inspectAndParse(content, sourceName);
+        if (!report.isValid()) {
+            return report;
+        }
+        try (FileOutputStream fos = new FileOutputStream(getCustomUploadedM3uFile())) {
+            fos.write((content != null ? content : "").getBytes(StandardCharsets.UTF_8));
+        } catch (IOException error) {
+            report.warnings.add("自定义 M3U 保存失败: " + error.getMessage());
+            return report;
+        }
+        mergeScanResults(report.channels, true);
+        return report;
+    }
+
+    public synchronized M3uParser.M3uInspectionReport importLocalM3uFile(File file) {
+        if (file == null || !file.exists() || file.length() > Integer.MAX_VALUE) {
+            return M3uParser.inspectAndParse("", file != null ? file.getName() : "empty.m3u");
+        }
+        try (InputStream is = new FileInputStream(file)) {
+            byte[] bytes = new byte[(int) file.length()];
+            int read = is.read(bytes);
+            String content = read > 0 ? new String(bytes, 0, read, StandardCharsets.UTF_8) : "";
+            return importCustomM3uContent(content, file.getName());
+        } catch (IOException error) {
+            return M3uParser.inspectAndParse("", file.getName());
+        }
+    }
+
+    public synchronized List<IptvChannel> extractEffectiveScannedChannels(List<IptvChannel> scanned) {
+        List<IptvChannel> source = scanned != null && !scanned.isEmpty() ? scanned : allChannels;
+        List<IptvChannel> connected = new ArrayList<>();
+        List<IptvChannel> allValid = new ArrayList<>();
+        for (IptvChannel channel : source) {
+            if (channel == null || TextUtils.isEmpty(channel.getRawUrl())) {
+                continue;
+            }
+            IptvChannel copy = channel.copy();
+            allValid.add(copy);
+            if (Boolean.TRUE.equals(channel.getConnected())) {
+                connected.add(copy);
+            }
+        }
+        return connected.isEmpty() ? allValid : connected;
+    }
+
+    public synchronized String buildScannedM3uContent(List<IptvChannel> scanned) {
+        return M3uParser.toM3uContent(extractEffectiveScannedChannels(scanned), false, null);
+    }
+
+    /** Saves scan output under app-controlled storage and returns the exact file written. */
+    public synchronized File saveScannedM3uToLocalFile(List<IptvChannel> scanned, String requestedName) {
+        String name = TextUtils.isEmpty(requestedName)
+                ? "iptv_scanned_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".m3u"
+                : requestedName.trim();
+        if (!name.toLowerCase(Locale.ROOT).endsWith(".m3u")
+                && !name.toLowerCase(Locale.ROOT).endsWith(".m3u8")) {
+            name += ".m3u";
+        }
+        File output = new File(getScanRootDir(), name);
+        try (FileOutputStream fos = new FileOutputStream(output)) {
+            fos.write(buildScannedM3uContent(scanned).getBytes(StandardCharsets.UTF_8));
+            lastSavedLocalM3uFile = output;
+        } catch (IOException ignored) {
+        }
+        return output;
+    }
+
+    public File getLastSavedLocalM3uFile() {
+        return lastSavedLocalM3uFile;
     }
 
     public File getScanRootDir() {

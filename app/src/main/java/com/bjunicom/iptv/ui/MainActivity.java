@@ -31,9 +31,11 @@ import com.bjunicom.iptv.IptvApplication;
 import com.bjunicom.iptv.R;
 import com.bjunicom.iptv.config.IptvSettings;
 import com.bjunicom.iptv.model.IptvChannel;
+import com.bjunicom.iptv.network.TransportRouteCache;
 import com.bjunicom.iptv.network.StreamUrlResolver;
 import com.bjunicom.iptv.player.IjkVideoView;
 import com.bjunicom.iptv.player.MeasureHelper;
+import com.bjunicom.iptv.player.PlaybackFailure;
 import com.bjunicom.iptv.repository.ChannelRepository;
 import com.bjunicom.iptv.ui.adapter.CategoryAdapter;
 import com.bjunicom.iptv.ui.adapter.ChannelAdapter;
@@ -560,7 +562,8 @@ public class MainActivity extends AppCompatActivity {
             loadingOverlay.setVisibility(View.GONE);
             if (currentChannel != null) {
                 currentChannel.setConnected(true);
-                currentChannel.setLatencyMs(videoView.getPrepareCostMs());
+                long firstFrameCost = videoView.getFirstFrameCostMs();
+                currentChannel.setLatencyMs(firstFrameCost >= 0 ? firstFrameCost : videoView.getPrepareCostMs());
                 String vTrack = videoView.getFormattedVideoTrackInfo();
                 String aTrack = videoView.getFormattedAudioTrackInfo();
                 String detectedRes = videoView.getDetectedResolutionFlag();
@@ -594,8 +597,14 @@ public class MainActivity extends AppCompatActivity {
         });
 
         videoView.setOnErrorListener((mp, frameworkErr, implErr) -> {
-            if (currentChannel != null && !fallbackToLocalProxyAttempted) {
+            PlaybackFailure failure = videoView.getLastFailure();
+            boolean externalProxyFailure = failure == PlaybackFailure.NETWORK
+                    && currentChannel != null
+                    && currentChannel.isMulticastStream()
+                    && TransportRouteCache.isExternalProxy(videoView.getPlaybackUri());
+            if (externalProxyFailure && !fallbackToLocalProxyAttempted) {
                 fallbackToLocalProxyAttempted = true;
+                TransportRouteCache.recordNetworkFailure(videoView.getPlaybackUri());
                 if (settings.getStreamMode() == IptvSettings.STREAM_MODE_UDPXY) {
                     udpxyUnreachableInSession = true;
                 }
@@ -617,7 +626,9 @@ public class MainActivity extends AppCompatActivity {
                 currentChannel.setConnected(false);
                 channelAdapter.notifyDataSetChanged();
             }
-            tvOsdTrackInfo.setText("连接失败 (请按遥控器[菜单]检查 udpxy/内置组播代理设置，或按[绿键]打开「组播动态扫描」)");
+            tvOsdTrackInfo.setText(failure == PlaybackFailure.NETWORK
+                    ? "连接失败 (请按遥控器[菜单]检查 udpxy/内置组播代理设置，或按[绿键]打开「组播动态扫描」)"
+                    : "播放失败：当前频道的音视频格式或解码器不可用，请尝试其它频道或播放器");
             showHudTemporarily();
             return true;
         });
@@ -685,7 +696,8 @@ public class MainActivity extends AppCompatActivity {
         if (forceSystemPlayerFor4k && localProxyPort > 0) {
             resolvedUrl = StreamUrlResolver.toUdpxyUrl(channel.getRawUrl(), "127.0.0.1:" + localProxyPort);
         } else if (settings.getStreamMode() == IptvSettings.STREAM_MODE_UDPXY
-                && udpxyUnreachableInSession
+                && (udpxyUnreachableInSession || TransportRouteCache.shouldBypass(android.net.Uri.parse(
+                StreamUrlResolver.toUdpxyUrl(channel.getRawUrl(), settings.getUdpxyAddress()))))
                 && localProxyPort > 0) {
             // 若当前会话已检测到外部 udpxy 不可达，切台时直接走本地网卡组播直连，避免每次切台等待 udpxy 超时
             fallbackToLocalProxyAttempted = true;
@@ -1152,6 +1164,7 @@ public class MainActivity extends AppCompatActivity {
 
                     settings.setUdpxyAddress(etUdpxy.getText().toString());
                     udpxyUnreachableInSession = false;
+                    TransportRouteCache.clear();
 
                     int checkedCore = rgPlayerCore.getCheckedRadioButtonId();
                     if (checkedCore == R.id.rb_core_exo) {

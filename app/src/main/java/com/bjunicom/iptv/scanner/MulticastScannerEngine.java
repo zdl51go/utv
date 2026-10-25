@@ -6,6 +6,7 @@ import android.text.TextUtils;
 import com.bjunicom.iptv.config.IptvSettings;
 import com.bjunicom.iptv.model.IptvChannel;
 import com.bjunicom.iptv.network.LocalMulticastProxyServer;
+import com.bjunicom.iptv.network.RtpTsPacketParser;
 import com.bjunicom.iptv.network.StreamUrlResolver;
 import com.bjunicom.iptv.parser.M3uParser;
 import com.bjunicom.iptv.repository.ChannelRepository;
@@ -138,7 +139,12 @@ public class MulticastScannerEngine {
         File runDir = createRunDirectory();
         ScanStatistics stats = initStats(runDir);
 
-        List<IptvChannel> channels = repository.getAllChannels();
+        List<IptvChannel> channels = new ArrayList<>();
+        for (IptvChannel channel : repository.getAllChannels()) {
+            if (channel != null) {
+                channels.add(channel.copy());
+            }
+        }
         int total = channels.size();
         StringBuilder scriptLog = new StringBuilder();
         StringBuilder mismatchLog = new StringBuilder("Resolution Mismatch Log\n-----------------------\n");
@@ -233,7 +239,7 @@ public class MulticastScannerEngine {
                         int idx = counterGen.getAndIncrement();
                         IptvChannel channel;
                         if (known != null) {
-                            channel = known;
+                            channel = known.copy();
                         } else {
                             String rawUrl = "rtp://" + ip + ":" + port;
                             String extInf = String.format(Locale.US,
@@ -493,11 +499,25 @@ public class MulticastScannerEngine {
             int code = conn.getResponseCode();
             if (code >= 200 && code < 300) {
                 try (InputStream is = conn.getInputStream()) {
-                    byte[] buf = new byte[1316];
-                    int read = is.read(buf);
-                    if (read > 0 && containsTsSyncByte(buf, read)) {
-                        result.connected = true;
-                        populateStreamTrackDetails(result, buf, read, knownChannel);
+                    byte[] buf = new byte[188 * 28];
+                    int totalRead = 0;
+                    long deadline = System.currentTimeMillis() + Math.max(400, timeoutMs);
+                    while (totalRead < buf.length && System.currentTimeMillis() < deadline) {
+                        int read = is.read(buf, totalRead, buf.length - totalRead);
+                        if (read <= 0) {
+                            break;
+                        }
+                        totalRead += read;
+                        String head = new String(buf, 0, Math.min(totalRead, 160), StandardCharsets.UTF_8);
+                        if (head.contains("#EXTM3U") || head.contains("#EXT-X-")) {
+                            result.connected = true;
+                            break;
+                        }
+                        if (countAlignedTsPackets(buf, totalRead) >= 3) {
+                            result.connected = true;
+                            populateStreamTrackDetails(result, buf, totalRead, knownChannel);
+                            break;
+                        }
                     }
                 }
             }
@@ -528,13 +548,19 @@ public class MulticastScannerEngine {
             }
             socket.joinGroup(group);
 
-            byte[] buf = new byte[1500];
+            byte[] buf = new byte[65535];
             DatagramPacket packet = new DatagramPacket(buf, buf.length);
-            socket.receive(packet);
-            int len = packet.getLength();
-            if (len >= 12 && containsTsSyncByte(buf, len)) {
-                result.connected = true;
-                populateStreamTrackDetails(result, buf, len, knownChannel);
+            RtpTsPacketParser parser = new RtpTsPacketParser();
+            long deadline = System.currentTimeMillis() + Math.max(300, timeoutMs);
+            while (System.currentTimeMillis() < deadline) {
+                packet.setLength(buf.length);
+                socket.receive(packet);
+                RtpTsPacketParser.Payload payload = parser.parse(buf, packet.getLength());
+                if (payload != null) {
+                    result.connected = true;
+                    populateStreamTrackDetails(result, buf, payload.offset + payload.length, knownChannel);
+                    break;
+                }
             }
         } catch (Exception ignored) {
         } finally {
@@ -567,6 +593,24 @@ public class MulticastScannerEngine {
             }
         }
         return false;
+    }
+
+    private int countAlignedTsPackets(byte[] buf, int len) {
+        int best = 0;
+        for (int start = 0; start < Math.min(188, len); start++) {
+            if ((buf[start] & 0xFF) != 0x47) {
+                continue;
+            }
+            int count = 1;
+            for (int p = start + 188; p < len; p += 188) {
+                if ((buf[p] & 0xFF) != 0x47) {
+                    break;
+                }
+                count++;
+            }
+            best = Math.max(best, count);
+        }
+        return best;
     }
 
     /**

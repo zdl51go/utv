@@ -233,6 +233,17 @@ public class IptvChannel implements Serializable {
         this.favorite = favorite;
     }
 
+    public boolean isMulticastStream() {
+        if (!isEmpty(multicastIp) && multicastPort > 0) {
+            return true;
+        }
+        return rawUrl != null && (rawUrl.startsWith("rtp://") || rawUrl.startsWith("udp://"));
+    }
+
+    public boolean isHlsStream() {
+        return rawUrl != null && rawUrl.toLowerCase(java.util.Locale.US).contains(".m3u8");
+    }
+
     public String getMulticastKey() {
         if (!isEmpty(multicastIp) && multicastPort > 0) {
             return multicastIp + ":" + multicastPort;
@@ -281,6 +292,34 @@ public class IptvChannel implements Serializable {
                 tvgLogo != null ? tvgLogo : "",
                 groupStr,
                 updatedTitle);
+    }
+
+    public IptvChannel copy() {
+        IptvChannel c = new IptvChannel();
+        c.index = index;
+        c.channelNumber = channelNumber;
+        c.rawExtInfLine = rawExtInfLine;
+        c.rawTitle = rawTitle;
+        c.displayName = displayName;
+        c.tvgId = tvgId;
+        c.tvgName = tvgName;
+        c.tvgLogo = tvgLogo;
+        c.groupTitleRaw = groupTitleRaw;
+        c.groups = groups != null ? new ArrayList<>(groups) : new ArrayList<>();
+        c.rawUrl = rawUrl;
+        c.multicastIp = multicastIp;
+        c.multicastPort = multicastPort;
+        c.resolutionTag = resolutionTag;
+        c.videoTrackInfo = videoTrackInfo;
+        c.audioTrackInfo = audioTrackInfo;
+        c.screenshotPath = screenshotPath;
+        c.connected = connected;
+        c.actualResolutionFlag = actualResolutionFlag;
+        c.resolutionMismatch = resolutionMismatch;
+        c.latencyMs = latencyMs;
+        c.discoveredByScan = discoveredByScan;
+        c.favorite = favorite;
+        return c;
     }
 
     private static boolean isEmpty(CharSequence s) {

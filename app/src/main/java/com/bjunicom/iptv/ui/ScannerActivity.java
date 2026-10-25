@@ -29,6 +29,7 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
@@ -57,6 +58,7 @@ public class ScannerActivity extends AppCompatActivity {
     private ChannelRepository repository;
     private MulticastScannerEngine scannerEngine;
     private ScanStatistics lastStats;
+    private List<IptvChannel> lastScannedChannels = new ArrayList<>();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final StringBuilder logBuffer = new StringBuilder();
 
@@ -189,6 +191,8 @@ public class ScannerActivity extends AppCompatActivity {
                     @Override
                     public void onCompleted(List<IptvChannel> resultChannels, ScanStatistics stats) {
                         mainHandler.post(() -> {
+                            lastScannedChannels = resultChannels != null
+                                    ? new ArrayList<>(resultChannels) : new ArrayList<>();
                             lastStats = stats;
                             btnStartScan.setEnabled(true);
                             btnStopScan.setEnabled(false);
@@ -221,8 +225,15 @@ public class ScannerActivity extends AppCompatActivity {
             File m3uFile = new File(outDir, "modified_iptv.m3u");
             File csvFile = new File(outDir, "results.csv");
 
-            List<IptvChannel> all = repository.getAllChannels();
+            List<IptvChannel> all = lastScannedChannels.isEmpty()
+                    ? repository.getAllChannels() : lastScannedChannels;
             String m3uContent = M3uParser.toM3uContent(all, false, settings.getUdpxyAddress());
+            M3uParser.M3uInspectionReport report = M3uParser.inspectAndParse(m3uContent, "modified_iptv.m3u");
+            if (!report.isValid()) {
+                String warning = report.warnings.isEmpty() ? "文件内容无效" : report.warnings.get(0);
+                Toast.makeText(this, "导出前 M3U 校验失败：" + warning, Toast.LENGTH_LONG).show();
+                return;
+            }
             String csvContent = M3uParser.toResultsCsvContent(all);
 
             try (FileOutputStream fos = new FileOutputStream(m3uFile)) {

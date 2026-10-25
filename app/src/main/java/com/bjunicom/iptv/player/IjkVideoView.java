@@ -132,6 +132,8 @@ public class IjkVideoView extends FrameLayout {
 
     private long mPrepareStartTime = 0;
     private long mPrepareEndTime = 0;
+    private PlaybackMetrics mPlaybackMetrics;
+    private PlaybackFailure mLastFailure = PlaybackFailure.UNKNOWN;
 
     public IjkVideoView(Context context) {
         super(context);
@@ -250,6 +252,8 @@ public class IjkVideoView extends FrameLayout {
         mUri = uri;
         mHeaders = headers;
         mHevcFreshRetryCount = 0;
+        mPlaybackMetrics = new PlaybackMetrics();
+        mLastFailure = PlaybackFailure.UNKNOWN;
         openVideo();
         requestLayout();
         invalidate();
@@ -588,6 +592,22 @@ public class IjkVideoView extends FrameLayout {
         return mPrepareEndTime > mPrepareStartTime ? (mPrepareEndTime - mPrepareStartTime) : 0;
     }
 
+    public PlaybackFailure getLastFailure() {
+        return mLastFailure;
+    }
+
+    public Uri getPlaybackUri() {
+        return mUri;
+    }
+
+    public long getFirstFrameCostMs() {
+        return mPlaybackMetrics != null ? mPlaybackMetrics.getFirstVideoMs() : -1;
+    }
+
+    public String getStartupMetricsSummary() {
+        return mPlaybackMetrics != null ? mPlaybackMetrics.summary() : "";
+    }
+
     /**
      * 获取实时网络下载速度 (Bytes/sec)
      * 优先从分离的池化下载模块获取精确实时速率（同时支持 IGMP 组播与 HTTP-TS）
@@ -860,6 +880,9 @@ public class IjkVideoView extends FrameLayout {
         public void onPrepared(IMediaPlayer mp) {
             mPrepareEndTime = System.currentTimeMillis();
             mCurrentState = STATE_PREPARED;
+            if (mPlaybackMetrics != null) {
+                mPlaybackMetrics.prepared();
+            }
 
             try {
                 mp.setVolume(1.0f, 1.0f);
@@ -1009,6 +1032,9 @@ public class IjkVideoView extends FrameLayout {
     private final IMediaPlayer.OnInfoListener mInfoListener = new IMediaPlayer.OnInfoListener() {
         @Override
         public boolean onInfo(IMediaPlayer mp, int arg1, int arg2) {
+            if (mPlaybackMetrics != null) {
+                mPlaybackMetrics.onInfo(arg1);
+            }
             if (mOnInfoListener != null) {
                 mOnInfoListener.onInfo(mp, arg1, arg2);
             }
@@ -1026,6 +1052,7 @@ public class IjkVideoView extends FrameLayout {
         @Override
         public boolean onError(IMediaPlayer mp, int frameworkErr, int implErr) {
             Log.e(TAG, "Playback error: " + frameworkErr + ", " + implErr);
+            mLastFailure = PlaybackFailure.fromLegacy(frameworkErr, implErr);
             mCurrentState = STATE_ERROR;
             mTargetState = STATE_ERROR;
             if (mOnErrorListener != null) {
