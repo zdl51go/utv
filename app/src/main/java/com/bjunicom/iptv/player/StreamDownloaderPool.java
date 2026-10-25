@@ -655,6 +655,7 @@ public class StreamDownloaderPool {
             }
 
             long elapsedSinceStart = System.currentTimeMillis() - parseStartTimeMs;
+            boolean hevcStream = TsCodecDescriptor.VIDEO_HEVC.equals(parsedVideoCodec);
 
             // 3. 在首个视频关键帧到达前，拦截并丢弃非关键帧视频包与超前到达的旧音频包
             if (!keyframeAligned) {
@@ -673,8 +674,8 @@ public class StreamDownloaderPool {
                         }
                         notifyCodecParsedIfNeeded(token, listener);
                     }
-                } else if (elapsedSinceStart >= KEYFRAME_ALIGN_MAX_WAIT_MS && hasPmt) {
-                    // 安全兜底：若超过 420ms 仍未遇到显式 IDR 标记，立即放行，防止特殊流卡住
+                } else if (!hevcStream && elapsedSinceStart >= KEYFRAME_ALIGN_MAX_WAIT_MS && hasPmt) {
+                    // H.264 等非 HEVC 特殊流保留安全兜底；HEVC 必须等真实 IDR 才能放行
                     keyframeAligned = true;
                     audioAligned = true;
                     if (hasPat) {
@@ -684,7 +685,7 @@ public class StreamDownloaderPool {
                         writeTsPacketToRing(cachedPmtPacket, 0);
                     }
                     notifyCodecParsedIfNeeded(token, listener);
-                } else if (elapsedSinceStart >= KEYFRAME_ALIGN_MAX_WAIT_MS * 2) {
+                } else if (!hevcStream && elapsedSinceStart >= KEYFRAME_ALIGN_MAX_WAIT_MS * 2) {
                     keyframeAligned = true;
                     audioAligned = true;
                     notifyCodecParsedIfNeeded(token, listener);
@@ -882,7 +883,9 @@ public class StreamDownloaderPool {
                     }
                     if (isHevc) {
                         int nalType = (nalByte >>> 1) & 0x3F;
-                        if (nalType == 32 || nalType == 33 || nalType == 19 || nalType == 20 || nalType == 21) {
+                        // HEVC 只有 IDR/CRA 才能作为解码起点；VPS/SPS 可能先于完整 IDR 到达，
+                        // 不能仅凭参数集就提前创建解码器。
+                        if (nalType == 19 || nalType == 20 || nalType == 21) {
                             return true;
                         }
                     } else {
