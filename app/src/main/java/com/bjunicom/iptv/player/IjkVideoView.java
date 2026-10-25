@@ -110,6 +110,7 @@ public class IjkVideoView extends FrameLayout {
     // 完好 IDR 即可恢复硬解；重试耗尽后才一次性回退系统播放器，任何切台都重新优先 IJK
     private int mHevcFreshRetryCount = 0;
     private static final int MAX_HEVC_FRESH_RETRIES = 2;
+    private static final long HEVC_FALLBACK_DELAY_MS = 1800L;
 
     /**
      * HEVC 硬件解码静默降级为软件解码的回调（如索尼/联发科 OMX.MTK.VIDEO.DECODER.HEVC
@@ -1001,12 +1002,17 @@ public class IjkVideoView extends FrameLayout {
                         // channels until the app process was restarted.
                         release(false, true);
                         final long tokenAfterTeardown = mPlaybackSessionToken.get();
-                        post(() -> {
+                        // CodecDecoderPool releases the failed OMX instance on
+                        // its lifecycle thread. Give the TV's native window a
+                        // moment to disconnect before binding the system player
+                        // to the same TextureView surface; otherwise Android's
+                        // MediaPlayer reports setVideoSurfaceTexture(-22).
+                        postDelayed(() -> {
                             if (tokenAfterTeardown == mPlaybackSessionToken.get()
                                     && mOnHevcSoftwareDecodeListener != null) {
                                 mOnHevcSoftwareDecodeListener.onHevcSoftwareDecodeDetected();
                             }
-                        });
+                        }, HEVC_FALLBACK_DELAY_MS);
                         return true;
                     }
                 }

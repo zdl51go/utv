@@ -18,6 +18,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import tv.danmaku.ijk.media.player.IjkMediaPlayer;
@@ -27,7 +30,8 @@ import tv.danmaku.ijk.media.player.IjkMediaPlayer;
  *
  * 核心职责：
  * 1. 按下载模块实时解析出的 TsCodecDescriptor (如 H264+MP2、HEVC+EAC3、H264+AAC) 对解码器进行分类池化：
- *    - 视频/综合解码器池 (IjkMediaPlayer Pool)：按 Codec Profile Key 缓存已初始化并预配置好对应硬解/软解参数的 IjkMediaPlayer 实例。
+ *    - 视频/综合解码器池 (IjkMediaPlayer Pool)：按 Codec Profile Key 缓存已初始化并预配置好对应硬解/软解参数的 IjkMediaPlayer 实例；
+ *      HEVC 因 MTK OMX Surface 拆除竞态采用单次实例，H.264 等规格继续池化复用。
  *    - 硬件伴音解码器池 (MediaCodec + AudioTrack Pool)：按音频 MIME 类型 (audio/eac3, audio/ac3, audio/mpeg-L2, audio/mp4a-latm)
  *      池化 Android TV 硬件 MediaCodec 与 AudioTrack 实例，切台时仅需 flush() 即可复用，避免反复 stop/release/createDecoderByType。
  * 2. 切台时异步回收旧解码器 (后台线程执行 reset() 并重新注入 Codec 参数归还池中)，主线程零阻塞。
@@ -42,6 +46,10 @@ public class CodecDecoderPool {
     private static volatile CodecDecoderPool instance;
 
     private final Map<String, Queue<PooledIjkDecoder>> ijkDecoderPools = new ConcurrentHashMap<>();
+    // MTK HEVC teardown is asynchronous. Keep the release future so the next
+    // HEVC instance is not created while the previous OMX surface is still
+    // connected.
+    private final Map<String, Future<?>> pendingIjkReleases = new ConcurrentHashMap<>();
     private final Map<String, Queue<PooledHwAudioDecoder>> hwAudioPools = new ConcurrentHashMap<>();
     private final ExecutorService lifecycleExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "CodecDecoderPoolRecycler");
@@ -213,8 +221,17 @@ public class CodecDecoderPool {
         String profileKey = safeDesc.toDecoderPoolKey(settings);
         Queue<PooledIjkDecoder> queue = getOrCreateIjkQueue(profileKey);
 
+        if (safeDesc.isHevc()) {
+            // HEVC decoder instances are deliberately single-use. Waiting for
+            // the previous release and dropping any legacy queued slot avoids
+            // MTK nativeWindowConnect(-22) failures after switching between
+            // 4K and HD channels.
+            awaitPendingIjkRelease(profileKey);
+            drainQueuedIjkDecoders(queue, profileKey);
+        }
+
         PooledIjkDecoder pooled = queue.poll();
-        if (pooled != null && pooled.player != null) {
+        if (!safeDesc.isHevc() && pooled != null && pooled.player != null) {
             int hits = ijkReuseHits.incrementAndGet();
             Log.i(TAG, "Reused pooled IjkMediaPlayer for profile=" + profileKey + " (hits=" + hits + ")");
             return new PooledIjkDecoder(pooled.player, profileKey, safeDesc, true);
@@ -244,16 +261,20 @@ public class CodecDecoderPool {
         } catch (Throwable ignored) {
         }
 
-        lifecycleExecutor.execute(() -> {
-            Queue<PooledIjkDecoder> queue = getOrCreateIjkQueue(decoderSlot.profileKey);
-            if (healthy && queue.size() < MAX_IJK_PER_PROFILE) {
+        final boolean allowPooling = healthy
+                && decoderSlot.codecDescriptor != null
+                && !decoderSlot.codecDescriptor.isHevc();
+        final String profileKey = decoderSlot.profileKey;
+        FutureTask<Void> releaseTask = new FutureTask<Void>(() -> {
+            Queue<PooledIjkDecoder> queue = getOrCreateIjkQueue(profileKey);
+            if (allowPooling && queue.size() < MAX_IJK_PER_PROFILE) {
                 try {
                     mp.reset();
                     configureIjkOptionsForCodec(mp, decoderSlot.codecDescriptor, settings);
-                    queue.offer(new PooledIjkDecoder(mp, decoderSlot.profileKey, decoderSlot.codecDescriptor, true));
-                    Log.d(TAG, "Recycled IjkMediaPlayer back to pool: " + decoderSlot.profileKey
+                    queue.offer(new PooledIjkDecoder(mp, profileKey, decoderSlot.codecDescriptor, true));
+                    Log.d(TAG, "Recycled IjkMediaPlayer back to pool: " + profileKey
                             + " (poolSize=" + queue.size() + ")");
-                    return;
+                    return null;
                 } catch (Throwable t) {
                     Log.w(TAG, "reset() failed during recycle, releasing native instance: " + t.getMessage());
                 }
@@ -262,7 +283,17 @@ public class CodecDecoderPool {
                 mp.release();
             } catch (Throwable ignored) {
             }
-        });
+            return null;
+        }) {
+            @Override
+            protected void done() {
+                pendingIjkReleases.remove(profileKey, this);
+            }
+        };
+        if (decoderSlot.codecDescriptor != null && decoderSlot.codecDescriptor.isHevc()) {
+            pendingIjkReleases.put(profileKey, releaseTask);
+        }
+        lifecycleExecutor.execute(releaseTask);
     }
 
     /**
@@ -278,6 +309,23 @@ public class CodecDecoderPool {
         if (q == null) {
             return;
         }
+        awaitPendingIjkRelease(key);
+        drainQueuedIjkDecoders(q, key);
+    }
+
+    private void awaitPendingIjkRelease(String profileKey) {
+        Future<?> pending = pendingIjkReleases.get(profileKey);
+        if (pending == null) {
+            return;
+        }
+        try {
+            pending.get(3000L, TimeUnit.MILLISECONDS);
+        } catch (Throwable t) {
+            Log.w(TAG, "Timed out waiting for decoder release: " + profileKey);
+        }
+    }
+
+    private void drainQueuedIjkDecoders(Queue<PooledIjkDecoder> q, String profileKey) {
         PooledIjkDecoder slot;
         int drained = 0;
         while ((slot = q.poll()) != null) {
@@ -288,7 +336,7 @@ public class CodecDecoderPool {
             drained++;
         }
         if (drained > 0) {
-            Log.i(TAG, "Drained " + drained + " pooled decoder(s) for profile=" + key
+            Log.i(TAG, "Drained " + drained + " pooled decoder(s) for profile=" + profileKey
                     + " before fresh HEVC retry");
         }
     }
