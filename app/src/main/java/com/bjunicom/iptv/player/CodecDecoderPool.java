@@ -12,13 +12,13 @@ import android.util.Log;
 
 import com.bjunicom.iptv.config.IptvSettings;
 
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -48,9 +48,9 @@ public class CodecDecoderPool {
     private final Map<String, Queue<PooledIjkDecoder>> ijkDecoderPools = new ConcurrentHashMap<>();
     // Decoder teardown is asynchronous. Keep release futures so a new decoder
     // is not configured while the previous OMX surface/resource is still live.
-    private final Map<String, Future<?>> pendingIjkReleases = new ConcurrentHashMap<>();
-    private static final long IJK_RELEASE_GRACE_MS = 350L;
-    private static final long HEVC_RELEASE_GRACE_MS = 1500L;
+    private final Map<String, Queue<FutureTask<Void>>> pendingIjkReleases = new ConcurrentHashMap<>();
+    private static final long IJK_RELEASE_GRACE_MS = 750L;
+    private static final long HEVC_RELEASE_GRACE_MS = 3500L;
     private final Map<String, Queue<PooledHwAudioDecoder>> hwAudioPools = new ConcurrentHashMap<>();
     private final ExecutorService lifecycleExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "CodecDecoderPoolRecycler");
@@ -233,7 +233,7 @@ public class CodecDecoderPool {
             // MTK nativeWindowConnect(-22) failures after switching between
             // 4K and HD channels.
             awaitPendingIjkRelease(profileKey);
-            drainQueuedIjkDecoders(queue, profileKey);
+            drainQueuedIjkDecoders(queue, profileKey, settings);
         }
 
         PooledIjkDecoder pooled = queue.poll();
@@ -304,10 +304,17 @@ public class CodecDecoderPool {
         }) {
             @Override
             protected void done() {
-                pendingIjkReleases.remove(profileKey, this);
+                Queue<FutureTask<Void>> pending = pendingIjkReleases.get(profileKey);
+                if (pending != null) {
+                    pending.remove(this);
+                    if (pending.isEmpty()) {
+                        pendingIjkReleases.remove(profileKey, pending);
+                    }
+                }
             }
         };
-        pendingIjkReleases.put(profileKey, releaseTask);
+        pendingIjkReleases.computeIfAbsent(profileKey, key -> new ConcurrentLinkedQueue<>())
+                .offer(releaseTask);
         lifecycleExecutor.execute(releaseTask);
     }
 
@@ -325,18 +332,20 @@ public class CodecDecoderPool {
             return;
         }
         awaitPendingIjkRelease(key);
-        drainQueuedIjkDecoders(q, key);
+        drainQueuedIjkDecoders(q, key, settings);
     }
 
     private void awaitPendingIjkRelease(String profileKey) {
-        Future<?> pending = pendingIjkReleases.get(profileKey);
-        if (pending == null) {
+        Queue<FutureTask<Void>> pending = pendingIjkReleases.get(profileKey);
+        if (pending == null || pending.isEmpty()) {
             return;
         }
-        try {
-            pending.get(3000L, TimeUnit.MILLISECONDS);
-        } catch (Throwable t) {
-            Log.w(TAG, "Timed out waiting for decoder release: " + profileKey);
+        for (FutureTask<Void> task : new ArrayList<>(pending)) {
+            try {
+                task.get(5000L, TimeUnit.MILLISECONDS);
+            } catch (Throwable t) {
+                Log.w(TAG, "Timed out waiting for decoder release: " + profileKey);
+            }
         }
     }
 
@@ -346,14 +355,17 @@ public class CodecDecoderPool {
         }
     }
 
-    private void drainQueuedIjkDecoders(Queue<PooledIjkDecoder> q, String profileKey) {
+    private void drainQueuedIjkDecoders(Queue<PooledIjkDecoder> q,
+                                        String profileKey,
+                                        IptvSettings settings) {
         PooledIjkDecoder slot;
         int drained = 0;
         while ((slot = q.poll()) != null) {
-            try {
-                slot.player.release();
-            } catch (Throwable ignored) {
-            }
+            // Route queued instances through the same tracked lifecycle path
+            // as active instances. Direct release() here used to leave a
+            // native Surface connection alive while the fresh HEVC decoder
+            // was already configuring.
+            releaseIjkDecoder(slot, settings, false);
             drained++;
         }
         if (drained > 0) {

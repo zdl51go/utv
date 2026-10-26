@@ -16,7 +16,11 @@ import java.net.InetSocketAddress;
 import java.net.MulticastSocket;
 import java.net.NetworkInterface;
 import java.net.URL;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Deque;
+import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
@@ -138,6 +142,7 @@ public class StreamDownloaderPool {
         // 宽限内每 4 秒补发 IGMP 加入报告；超时后由上层兜底链路发起全新一轮加入
         private static final long MCAST_FIRST_PACKET_GRACE_MS = 45000L;
         private static final int MCAST_MAX_CONSECUTIVE_TIMEOUTS = 3;
+        private static final int HEVC_STARTUP_MAX_BYTES = 1536 * 1024;
 
         private final StreamDownloaderPool ownerPool;
         private final byte[] ringBuffer;
@@ -173,6 +178,17 @@ public class StreamDownloaderPool {
         private boolean parseClockAnchored = false;
         private boolean codecNotified = false;
         private volatile TsCodecDescriptor currentDescriptor = null;
+
+        // HEVC startup must contain VPS/SPS/PPS and a complete IDR/CRA access
+        // unit. The transport random-access flag alone can point into a
+        // damaged access unit after multicast loss.
+        private final HevcStartupGate hevcStartupGate = new HevcStartupGate();
+        private final Deque<byte[]> hevcStartupPackets = new ArrayDeque<>();
+        private final byte[] hevcScanTail = new byte[3];
+        private int hevcScanTailLen;
+        private int hevcStartupBytes;
+        private boolean hevcStartupWindowStarted;
+        private long hevcStartupFirstPts = -1L;
 
         // 实时下载速率统计 (Bytes/sec)
         private long speedWindowStartMs = 0L;
@@ -213,6 +229,7 @@ public class StreamDownloaderPool {
             codecNotified = false;
             parseClockAnchored = false;
             currentDescriptor = null;
+            resetHevcStartupGate();
             currentSpeedBytesPerSec = 0L;
             bytesInCurrentWindow = 0L;
             speedWindowStartMs = System.currentTimeMillis();
@@ -229,6 +246,7 @@ public class StreamDownloaderPool {
                 firstVideoPts = -1L;
                 codecNotified = false;
                 currentDescriptor = null;
+                resetHevcStartupGate();
             }
         }
 
@@ -657,6 +675,19 @@ public class StreamDownloaderPool {
             long elapsedSinceStart = System.currentTimeMillis() - parseStartTimeMs;
             boolean hevcStream = TsCodecDescriptor.VIDEO_HEVC.equals(parsedVideoCodec);
 
+            if (!keyframeAligned && hevcStream) {
+                if (hasPmt && videoPid > 0 && pid == videoPid
+                        && (adaptationCtrl & 0x01) != 0 && payloadStart < pktEnd) {
+                    if (observeHevcStartupPacket(token, buf, pktOffset, payloadStart, pktEnd,
+                            pusi, listener)) {
+                        return;
+                    }
+                }
+                // HEVC never uses the elapsed-time alignment fallback. Wait
+                // for an actual parameter-set + complete-IDR window.
+                return;
+            }
+
             // 3. 在首个视频关键帧到达前，拦截并丢弃非关键帧视频包与超前到达的旧音频包
             if (!keyframeAligned) {
                 if (hasPmt && videoPid > 0 && pid == videoPid && (adaptationCtrl & 0x01) != 0 && payloadStart < pktEnd) {
@@ -716,6 +747,110 @@ public class StreamDownloaderPool {
             }
 
             writeTsPacketToRing(buf, pktOffset);
+        }
+
+        private boolean observeHevcStartupPacket(int token,
+                                                 byte[] buf,
+                                                 int pktOffset,
+                                                 int payloadStart,
+                                                 int pktEnd,
+                                                 boolean pusi,
+                                                 OnStreamEventsListener listener) {
+            List<Integer> nalTypes = scanHevcNalTypes(buf, payloadStart, pktEnd);
+            boolean hasParameterSet = false;
+            for (Integer nalType : nalTypes) {
+                if (nalType == 32 || nalType == 33 || nalType == 34) {
+                    hasParameterSet = true;
+                    break;
+                }
+            }
+
+            if (!hevcStartupWindowStarted && hasParameterSet) {
+                resetHevcStartupGate();
+                hevcStartupWindowStarted = true;
+            }
+            if (!hevcStartupWindowStarted) {
+                return false;
+            }
+
+            if (pusi && hevcStartupFirstPts <= 0) {
+                hevcStartupFirstPts = parsePesPts(buf, payloadStart, pktEnd);
+            }
+            for (int i = 0; i < nalTypes.size(); i++) {
+                hevcStartupGate.observeNalStart(nalTypes.get(i), pusi && i == 0);
+            }
+            appendHevcStartupPacket(buf, pktOffset);
+
+            if (!hevcStartupGate.isReady() || !isTokenValid(token)) {
+                return false;
+            }
+
+            keyframeAligned = true;
+            audioAligned = false;
+            firstVideoPts = hevcStartupFirstPts;
+            if (hasPat) {
+                writeTsPacketToRing(cachedPatPacket, 0);
+            }
+            if (hasPmt) {
+                writeTsPacketToRing(cachedPmtPacket, 0);
+            }
+            while (!hevcStartupPackets.isEmpty()) {
+                byte[] startupPacket = hevcStartupPackets.removeFirst();
+                writeTsPacketToRing(startupPacket, 0);
+            }
+            hevcStartupBytes = 0;
+            hevcStartupWindowStarted = false;
+            notifyCodecParsedIfNeeded(token, listener);
+            return true;
+        }
+
+        private List<Integer> scanHevcNalTypes(byte[] buf, int start, int end) {
+            int payloadLength = Math.max(0, end - start);
+            byte[] combined = new byte[hevcScanTailLen + payloadLength];
+            if (hevcScanTailLen > 0) {
+                System.arraycopy(hevcScanTail, 0, combined, 0, hevcScanTailLen);
+            }
+            if (payloadLength > 0) {
+                System.arraycopy(buf, start, combined, hevcScanTailLen, payloadLength);
+            }
+
+            List<Integer> nalTypes = new ArrayList<>();
+            for (int i = 0; i + 3 < combined.length; i++) {
+                if (combined[i] == 0x00 && combined[i + 1] == 0x00 && combined[i + 2] == 0x01) {
+                    int nalByte = combined[i + 3] & 0xFF;
+                    int nalType = (nalByte >>> 1) & 0x3F;
+                    if (nalType != 48) { // PES stream_id (0xE0) is not a HEVC NAL
+                        nalTypes.add(nalType);
+                    }
+                }
+            }
+            hevcScanTailLen = Math.min(hevcScanTail.length, payloadLength);
+            if (hevcScanTailLen > 0) {
+                System.arraycopy(buf, end - hevcScanTailLen, hevcScanTail, 0, hevcScanTailLen);
+            }
+            return nalTypes;
+        }
+
+        private void appendHevcStartupPacket(byte[] buf, int pktOffset) {
+            byte[] packet = new byte[188];
+            System.arraycopy(buf, pktOffset, packet, 0, 188);
+            hevcStartupPackets.addLast(packet);
+            hevcStartupBytes += packet.length;
+            if (hevcStartupBytes > HEVC_STARTUP_MAX_BYTES) {
+                // A clean IDR should fit comfortably inside the startup
+                // window. If the network never gives us one, discard the
+                // stale candidate and wait for the next parameter-set group.
+                resetHevcStartupGate();
+            }
+        }
+
+        private void resetHevcStartupGate() {
+            hevcStartupGate.reset();
+            hevcStartupPackets.clear();
+            hevcStartupBytes = 0;
+            hevcStartupWindowStarted = false;
+            hevcStartupFirstPts = -1L;
+            hevcScanTailLen = 0;
         }
 
         private void notifyCodecParsedIfNeeded(int token, OnStreamEventsListener listener) {
