@@ -46,10 +46,11 @@ public class CodecDecoderPool {
     private static volatile CodecDecoderPool instance;
 
     private final Map<String, Queue<PooledIjkDecoder>> ijkDecoderPools = new ConcurrentHashMap<>();
-    // MTK HEVC teardown is asynchronous. Keep the release future so the next
-    // HEVC instance is not created while the previous OMX surface is still
-    // connected.
+    // Decoder teardown is asynchronous. Keep release futures so a new decoder
+    // is not configured while the previous OMX surface/resource is still live.
     private final Map<String, Future<?>> pendingIjkReleases = new ConcurrentHashMap<>();
+    private static final long IJK_RELEASE_GRACE_MS = 350L;
+    private static final long HEVC_RELEASE_GRACE_MS = 1500L;
     private final Map<String, Queue<PooledHwAudioDecoder>> hwAudioPools = new ConcurrentHashMap<>();
     private final ExecutorService lifecycleExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "CodecDecoderPoolRecycler");
@@ -221,6 +222,11 @@ public class CodecDecoderPool {
         String profileKey = safeDesc.toDecoderPoolKey(settings);
         Queue<PooledIjkDecoder> queue = getOrCreateIjkQueue(profileKey);
 
+        // A normal H.264 player may still be resetting when the user switches
+        // to 4K HEVC. Serialize all decoder transitions to avoid competing for
+        // the TV's single hardware video resource.
+        awaitPendingIjkReleases();
+
         if (safeDesc.isHevc()) {
             // HEVC decoder instances are deliberately single-use. Waiting for
             // the previous release and dropping any legacy queued slot avoids
@@ -272,6 +278,11 @@ public class CodecDecoderPool {
                     mp.reset();
                     configureIjkOptionsForCodec(mp, decoderSlot.codecDescriptor, settings);
                     queue.offer(new PooledIjkDecoder(mp, profileKey, decoderSlot.codecDescriptor, true));
+                    try {
+                        Thread.sleep(IJK_RELEASE_GRACE_MS);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
                     Log.d(TAG, "Recycled IjkMediaPlayer back to pool: " + profileKey
                             + " (poolSize=" + queue.size() + ")");
                     return null;
@@ -283,6 +294,12 @@ public class CodecDecoderPool {
                 mp.release();
             } catch (Throwable ignored) {
             }
+            try {
+                Thread.sleep(decoderSlot.codecDescriptor != null && decoderSlot.codecDescriptor.isHevc()
+                        ? HEVC_RELEASE_GRACE_MS : IJK_RELEASE_GRACE_MS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
             return null;
         }) {
             @Override
@@ -290,9 +307,7 @@ public class CodecDecoderPool {
                 pendingIjkReleases.remove(profileKey, this);
             }
         };
-        if (decoderSlot.codecDescriptor != null && decoderSlot.codecDescriptor.isHevc()) {
-            pendingIjkReleases.put(profileKey, releaseTask);
-        }
+        pendingIjkReleases.put(profileKey, releaseTask);
         lifecycleExecutor.execute(releaseTask);
     }
 
@@ -322,6 +337,12 @@ public class CodecDecoderPool {
             pending.get(3000L, TimeUnit.MILLISECONDS);
         } catch (Throwable t) {
             Log.w(TAG, "Timed out waiting for decoder release: " + profileKey);
+        }
+    }
+
+    private void awaitPendingIjkReleases() {
+        for (String profileKey : pendingIjkReleases.keySet()) {
+            awaitPendingIjkRelease(profileKey);
         }
     }
 

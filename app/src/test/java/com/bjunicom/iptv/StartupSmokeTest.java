@@ -110,6 +110,7 @@ public class StartupSmokeTest {
 
             int[] expectedOrder = {
                     R.id.btn_toggle_drawer,
+                    R.id.btn_switch_isp,
                     R.id.btn_open_scanner,
                     R.id.btn_open_settings,
                     R.id.btn_prev_channel,

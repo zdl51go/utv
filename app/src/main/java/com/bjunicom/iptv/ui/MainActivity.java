@@ -246,8 +246,8 @@ public class MainActivity extends AppCompatActivity {
     private void setupButtonFocusEffects() {
         hudButtons = new View[]{
                 findViewById(R.id.btn_toggle_drawer),
-                findViewById(R.id.btn_open_scanner),
                 findViewById(R.id.btn_switch_isp),
+                findViewById(R.id.btn_open_scanner),
                 findViewById(R.id.btn_open_settings),
                 findViewById(R.id.btn_prev_channel),
                 findViewById(R.id.btn_next_channel),
@@ -931,6 +931,7 @@ public class MainActivity extends AppCompatActivity {
         if (focused != null) {
             int id = focused.getId();
             if (id == R.id.btn_toggle_drawer
+                    || id == R.id.btn_switch_isp
                     || id == R.id.btn_open_scanner
                     || id == R.id.btn_open_settings
                     || id == R.id.btn_prev_channel
