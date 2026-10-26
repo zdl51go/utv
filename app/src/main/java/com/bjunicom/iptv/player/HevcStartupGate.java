@@ -10,14 +10,14 @@ public final class HevcStartupGate {
     private boolean vpsSeen;
     private boolean spsSeen;
     private boolean ppsSeen;
-    private int completedIdrCount;
+    private boolean idrCompleted;
 
     public void reset() {
         currentNalType = -1;
         vpsSeen = false;
         spsSeen = false;
         ppsSeen = false;
-        completedIdrCount = 0;
+        idrCompleted = false;
     }
 
     /**
@@ -28,7 +28,7 @@ public final class HevcStartupGate {
     public void observeNalStart(int nalType, boolean accessUnitBoundary) {
         if (isIdrNal(currentNalType)
                 && (accessUnitBoundary || nalType != currentNalType)) {
-            completedIdrCount++;
+            idrCompleted = true;
         }
         if (nalType == 32) {
             vpsSeen = true;
@@ -41,7 +41,7 @@ public final class HevcStartupGate {
     }
 
     public boolean isReady() {
-        return vpsSeen && spsSeen && ppsSeen && completedIdrCount >= 2;
+        return vpsSeen && spsSeen && ppsSeen && idrCompleted;
     }
 
     public boolean hasParameterSet(int nalType) {

@@ -21,11 +21,6 @@ public class HevcStartupGateTest {
 
         gate.observeNalStart(1, false); // next NAL proves the IDR ended
 
-        assertFalse(gate.isReady());
-
-        gate.observeNalStart(19, false); // second IDR starts
-        gate.observeNalStart(1, false); // second IDR ends
-
         assertTrue(gate.isReady());
     }
 
