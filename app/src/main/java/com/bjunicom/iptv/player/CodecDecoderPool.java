@@ -233,6 +233,13 @@ public class CodecDecoderPool {
             // MTK nativeWindowConnect(-22) failures after switching between
             // 4K and HD channels.
             awaitPendingIjkRelease(profileKey);
+            // A healthy H.264 instance is normally reset and pooled. On this
+            // TV, reset can leave the SurfaceView producer connected even
+            // after the player has been returned to the pool. Before creating
+            // HEVC, destroy every queued non-HEVC instance and wait for its
+            // native window to disconnect.
+            drainAllNonHevcIjkDecoders(profileKey, settings);
+            awaitPendingIjkReleases();
             drainQueuedIjkDecoders(queue, profileKey, settings);
         }
 
@@ -296,7 +303,8 @@ public class CodecDecoderPool {
             }
             try {
                 Thread.sleep(decoderSlot.codecDescriptor != null && decoderSlot.codecDescriptor.isHevc()
-                        ? HEVC_RELEASE_GRACE_MS : IJK_RELEASE_GRACE_MS);
+                        ? HEVC_RELEASE_GRACE_MS
+                        : (allowPooling ? IJK_RELEASE_GRACE_MS : HEVC_RELEASE_GRACE_MS));
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
             }
@@ -371,6 +379,18 @@ public class CodecDecoderPool {
         if (drained > 0) {
             Log.i(TAG, "Drained " + drained + " pooled decoder(s) for profile=" + profileKey
                     + " before fresh HEVC retry");
+        }
+    }
+
+    private void drainAllNonHevcIjkDecoders(String hevcProfileKey, IptvSettings settings) {
+        for (Map.Entry<String, Queue<PooledIjkDecoder>> entry : ijkDecoderPools.entrySet()) {
+            if (hevcProfileKey.equals(entry.getKey())) {
+                continue;
+            }
+            Queue<PooledIjkDecoder> queue = entry.getValue();
+            if (queue != null && !queue.isEmpty()) {
+                drainQueuedIjkDecoders(queue, entry.getKey(), settings);
+            }
         }
     }
 
