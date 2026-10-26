@@ -50,7 +50,9 @@ public class CodecDecoderPool {
     // is not configured while the previous OMX surface/resource is still live.
     private final Map<String, Queue<FutureTask<Void>>> pendingIjkReleases = new ConcurrentHashMap<>();
     private static final long IJK_RELEASE_GRACE_MS = 750L;
-    private static final long HEVC_RELEASE_GRACE_MS = 3500L;
+    // Recovery now recreates the SurfaceView, so the old native window only
+    // needs a short OMX teardown grace instead of the previous 3.5 seconds.
+    private static final long HEVC_RELEASE_GRACE_MS = 1500L;
     private final Map<String, Queue<PooledHwAudioDecoder>> hwAudioPools = new ConcurrentHashMap<>();
     private final ExecutorService lifecycleExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "CodecDecoderPoolRecycler");

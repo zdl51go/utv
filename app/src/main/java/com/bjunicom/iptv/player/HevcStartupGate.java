@@ -10,14 +10,14 @@ public final class HevcStartupGate {
     private boolean vpsSeen;
     private boolean spsSeen;
     private boolean ppsSeen;
-    private boolean idrCompleted;
+    private int completedIdrCount;
 
     public void reset() {
         currentNalType = -1;
         vpsSeen = false;
         spsSeen = false;
         ppsSeen = false;
-        idrCompleted = false;
+        completedIdrCount = 0;
     }
 
     /**
@@ -26,11 +26,9 @@ public final class HevcStartupGate {
      * buffered startup window to FFmpeg.
      */
     public void observeNalStart(int nalType, boolean accessUnitBoundary) {
-        if (accessUnitBoundary && isIdrNal(currentNalType)) {
-            idrCompleted = true;
-        }
-        if (isIdrNal(currentNalType) && nalType != currentNalType) {
-            idrCompleted = true;
+        if (isIdrNal(currentNalType)
+                && (accessUnitBoundary || nalType != currentNalType)) {
+            completedIdrCount++;
         }
         if (nalType == 32) {
             vpsSeen = true;
@@ -43,7 +41,7 @@ public final class HevcStartupGate {
     }
 
     public boolean isReady() {
-        return vpsSeen && spsSeen && ppsSeen && idrCompleted;
+        return vpsSeen && spsSeen && ppsSeen && completedIdrCount >= 2;
     }
 
     public boolean hasParameterSet(int nalType) {
