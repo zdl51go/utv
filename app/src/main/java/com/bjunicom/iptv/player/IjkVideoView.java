@@ -95,6 +95,7 @@ public class IjkVideoView extends FrameLayout {
     private IptvSettings mSettings;
     private int mCurrentRender = RENDER_SURFACE_VIEW;
     private IRenderView mRenderView;
+    private boolean mOpenOnSurfaceCreated = true;
     private int mCurrentAspectRatioIndex = 0;
     private int mCurrentAspectRatio = s_allAspectRatio[0];
 
@@ -1010,6 +1011,9 @@ public class IjkVideoView extends FrameLayout {
                         // software/failed HEVC slot. That poisoned all later 4K
                         // channels until the app process was restarted.
                         release(false, true);
+                        // Do not let the new SurfaceView callback reopen IJK
+                        // before MainActivity has selected the system player.
+                        recreateRenderViewForRecovery(false);
                         final long tokenAfterTeardown = mPlaybackSessionToken.get();
                         // CodecDecoderPool releases the failed OMX instance on
                         // its lifecycle thread. Give the TV's native window a
@@ -1049,13 +1053,41 @@ public class IjkVideoView extends FrameLayout {
         CodecDecoderPool.getInstance().drainIjkDecodersForProfile(descriptorBeforeTeardown, mSettings);
         mTargetState = STATE_PLAYING;
         final long tokenAfterTeardown = mPlaybackSessionToken.get();
-        postDelayed(() -> {
-            if (tokenAfterTeardown != mPlaybackSessionToken.get() || mForceFallbackPlayer) {
-                return; // 期间用户已切台或兜底已触发
-            }
-            Log.i(TAG, "Fresh HEVC decode retry " + mHevcFreshRetryCount + ": re-opening stream");
-            openVideo();
-        }, 800);
+        if (!recreateRenderViewForRecovery(true)) {
+            postDelayed(() -> {
+                if (tokenAfterTeardown != mPlaybackSessionToken.get() || mForceFallbackPlayer) {
+                    return; // 期间用户已切台或兜底已触发
+                }
+                Log.i(TAG, "Fresh HEVC decode retry " + mHevcFreshRetryCount + ": re-opening stream");
+                openVideo();
+            }, 800);
+        }
+    }
+
+    /**
+     * MTK can leave the old SurfaceView BufferQueue producer connected after a
+     * MediaCodec configure failure. Reusing the same holder makes every fresh
+     * HEVC instance fail with nativeWindowConnect(-22), so recovery gets a new
+     * SurfaceView and lets its callback reopen the stream.
+     */
+    private boolean recreateRenderViewForRecovery(boolean openWhenReady) {
+        if (mRenderView == null) {
+            return false;
+        }
+        int renderType = mCurrentRender;
+        try {
+            mRenderView.removeRenderCallback(mSHCallback);
+            removeView(mRenderView.getView());
+        } catch (Throwable ignored) {
+        }
+        mRenderView = null;
+        mSurfaceHolder = null;
+        mSurfaceWidth = 0;
+        mSurfaceHeight = 0;
+        mOpenOnSurfaceCreated = openWhenReady;
+        mCurrentRender = -1;
+        setRender(renderType);
+        return true;
     }
 
     private final IMediaPlayer.OnCompletionListener mCompletionListener = new IMediaPlayer.OnCompletionListener() {
@@ -1125,7 +1157,8 @@ public class IjkVideoView extends FrameLayout {
             mSurfaceHolder = holder;
             if (mMediaPlayer != null) {
                 bindSurfaceHolder(mMediaPlayer, holder);
-            } else {
+            } else if (mOpenOnSurfaceCreated) {
+                mOpenOnSurfaceCreated = false;
                 openVideo();
             }
         }
