@@ -559,16 +559,12 @@ public class MainActivity extends AppCompatActivity {
             hevcHwFallbackFor4k = true;
             Toast.makeText(this, "检测到 4K 硬件解码不可用，已切换系统播放器内核", Toast.LENGTH_LONG).show();
             if (currentChannel != null) {
-                playChannel(currentChannel);
+                playChannel(currentChannel, videoView.isPlaybackRequested());
             }
         });
 
         videoView.setOnPreparedListener(mp -> {
-            loadingOverlay.setVisibility(View.GONE);
             if (currentChannel != null) {
-                currentChannel.setConnected(true);
-                long firstFrameCost = videoView.getFirstFrameCostMs();
-                currentChannel.setLatencyMs(firstFrameCost >= 0 ? firstFrameCost : videoView.getPrepareCostMs());
                 String vTrack = videoView.getFormattedVideoTrackInfo();
                 String aTrack = videoView.getFormattedAudioTrackInfo();
                 String detectedRes = videoView.getDetectedResolutionFlag();
@@ -591,12 +587,20 @@ public class MainActivity extends AppCompatActivity {
             if (what == IMediaPlayer.MEDIA_INFO_BUFFERING_START) {
                 loadingOverlay.setVisibility(View.VISIBLE);
                 tvLoadingHint.setText("正在缓冲视频流...");
-            } else if (what == IMediaPlayer.MEDIA_INFO_BUFFERING_END
-                    || what == IMediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START) {
+            } else if (what == IMediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START
+                    || (what == IMediaPlayer.MEDIA_INFO_AUDIO_RENDERING_START && videoView.isAudioOnlyStream())) {
                 loadingOverlay.setVisibility(View.GONE);
                 if (currentChannel != null) {
+                    currentChannel.setConnected(true);
+                    currentChannel.setLatencyMs(what == IMediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START
+                            ? videoView.getFirstFrameCostMs() : videoView.getFirstAudioCostMs());
+                    channelAdapter.notifyDataSetChanged();
                     updateOsdWithChannel(currentChannel);
                 }
+            } else if (what == IMediaPlayer.MEDIA_INFO_BUFFERING_END
+                    && (videoView.getFirstFrameCostMs() >= 0
+                    || (videoView.isAudioOnlyStream() && videoView.getFirstAudioCostMs() >= 0))) {
+                loadingOverlay.setVisibility(View.GONE);
             }
             return true;
         });
@@ -679,10 +683,16 @@ public class MainActivity extends AppCompatActivity {
     }
 
     public void playChannel(IptvChannel channel) {
+        playChannel(channel, true);
+    }
+
+    private void playChannel(IptvChannel channel, boolean startPlayback) {
         if (channel == null) {
             return;
         }
         currentChannel = channel;
+        channel.setConnected(null);
+        channel.setLatencyMs(-1);
         fallbackToLocalProxyAttempted = false;
         settings.setLastChannelUrl(channel.getRawUrl());
         channelAdapter.setCurrentPlayingUrl(channel.getRawUrl());
@@ -719,7 +729,8 @@ public class MainActivity extends AppCompatActivity {
 
         videoView.setRawChannelUrl(channel.getRawUrl());
         videoView.setVideoPath(resolvedUrl);
-        videoView.start();
+        if (startPlayback) videoView.start();
+        else videoView.pause();
     }
 
     private void updateOsdWithChannel(IptvChannel ch) {
