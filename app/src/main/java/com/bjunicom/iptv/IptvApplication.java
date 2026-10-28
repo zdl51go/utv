@@ -5,7 +5,9 @@ import android.content.Context;
 import android.net.ConnectivityManager;
 import android.net.LinkProperties;
 import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
+import android.os.Build;
 import android.net.wifi.WifiManager;
 import android.util.Log;
 
@@ -56,8 +58,16 @@ public class IptvApplication extends Application {
         connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         if (connectivityManager != null) {
             try {
+                NetworkRequest.Builder request = new NetworkRequest.Builder();
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    request.clearCapabilities();
+                } else {
+                    request.removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
+                            .removeCapability(NetworkCapabilities.NET_CAPABILITY_TRUSTED)
+                            .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN);
+                }
                 connectivityManager.registerNetworkCallback(
-                        new NetworkRequest.Builder().clearCapabilities().build(), networkCallback);
+                        request.build(), networkCallback);
             } catch (RuntimeException error) {
                 Log.w(TAG, "Cannot observe network changes", error);
             }
