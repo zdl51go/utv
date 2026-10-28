@@ -1,6 +1,7 @@
 package com.bjunicom.iptv.player;
 
 import android.net.Uri;
+import android.os.SystemClock;
 import android.text.TextUtils;
 import android.util.Log;
 
@@ -65,9 +66,15 @@ public class StreamDownloaderPool {
     private static final AtomicBoolean httpTransportBroken = new AtomicBoolean(false);
 
     public interface OnStreamEventsListener {
+        default void onFirstPacket(PooledStreamDownloader downloader) {}
+
         void onCodecParsed(TsCodecDescriptor descriptor, PooledStreamDownloader downloader);
 
         void onStreamError(String reason, PooledStreamDownloader downloader);
+
+        default void onStreamError(PlaybackFailure failure, String reason, PooledStreamDownloader downloader) {
+            onStreamError(reason, downloader);
+        }
     }
 
     public interface TsPacketTeeListener {
@@ -116,7 +123,10 @@ public class StreamDownloaderPool {
         if (downloader == null) {
             return;
         }
-        downloader.stopSession();
+        downloader.releaseToPool();
+    }
+
+    private void recycle(PooledStreamDownloader downloader) {
         if (idlePool.size() < MAX_POOL_SIZE) {
             idlePool.offer(downloader);
         }
@@ -143,6 +153,7 @@ public class StreamDownloaderPool {
         private static final long MCAST_FIRST_PACKET_GRACE_MS = 45000L;
         private static final int MCAST_MAX_CONSECUTIVE_TIMEOUTS = 3;
         private static final int HEVC_STARTUP_MAX_BYTES = 1536 * 1024;
+        private static final long STARTUP_ALIGN_TIMEOUT_MS = 15000L;
 
         private final StreamDownloaderPool ownerPool;
         private final byte[] ringBuffer;
@@ -154,12 +165,22 @@ public class StreamDownloaderPool {
         private volatile boolean sessionActive = false;
         private volatile boolean streamEof = false;
         private final AtomicInteger sessionToken = new AtomicInteger(0);
+        // A stopped downloader remains owned by its worker until that worker has exited.
+        // Parser state and buffers cannot be reset for another channel in the meantime.
+        private boolean workerRunning;
+        private boolean recycleRequested;
 
         // MPEG-TS 实时解析与 IDR 对齐状态
-        private final byte[] cachedPatPacket = new byte[188];
-        private final byte[] cachedPmtPacket = new byte[188];
+        private byte[] cachedPatPackets;
+        private byte[] cachedPmtPackets;
+        private final TsPsiAssembler patAssembler = new TsPsiAssembler(0);
+        private final TsPsiAssembler pmtAssembler = new TsPsiAssembler(2);
+        private int programNumber = -1;
+        private int transportStreamId = -1;
         private boolean hasPat = false;
         private boolean hasPmt = false;
+        private final TsPacketValidator packetValidator = new TsPacketValidator();
+        private byte[] currentPmtSection;
         private int pmtPid = -1;
         private int videoPid = -1;
         private int audioPid = -1;
@@ -177,6 +198,8 @@ public class StreamDownloaderPool {
         // 导致 PAT/PMT 尚未解析就用默认 h264/mp2 凑数通知解码器（4K 频道将因此关闭 HEVC 硬解）
         private boolean parseClockAnchored = false;
         private boolean codecNotified = false;
+        private boolean firstPacketNotified;
+        private long firstPacketAtMs;
         private volatile TsCodecDescriptor currentDescriptor = null;
 
         // HEVC startup must contain VPS/SPS/PPS and a complete IDR/CRA access
@@ -205,7 +228,9 @@ public class StreamDownloaderPool {
             this.ringBuffer = new byte[bufferCapacity];
         }
 
-        void resetForAcquire() {
+        synchronized void resetForAcquire() {
+            if (workerRunning) throw new IllegalStateException("Downloader worker still running");
+            recycleRequested = false;
             sessionToken.incrementAndGet();
             sessionActive = false;
             streamEof = false;
@@ -216,6 +241,12 @@ public class StreamDownloaderPool {
             }
             hasPat = false;
             hasPmt = false;
+            packetValidator.reset();
+            patAssembler.reset();
+            pmtAssembler.reset();
+            cachedPatPackets = cachedPmtPackets = null;
+            programNumber = transportStreamId = -1;
+            currentPmtSection = null;
             pmtPid = -1;
             videoPid = -1;
             audioPid = -1;
@@ -227,6 +258,7 @@ public class StreamDownloaderPool {
             audioAligned = false;
             firstVideoPts = -1L;
             codecNotified = false;
+            firstPacketNotified = false;
             parseClockAnchored = false;
             currentDescriptor = null;
             resetHevcStartupGate();
@@ -237,6 +269,11 @@ public class StreamDownloaderPool {
 
         private void resetStartupAlignmentOnPacketLoss() {
             if (!keyframeAligned) {
+                packetValidator.reset();
+                patAssembler.reset();
+                pmtAssembler.reset();
+                cachedPatPackets = cachedPmtPackets = null;
+                programNumber = transportStreamId = -1;
                 hasPat = false;
                 hasPmt = false;
                 pmtPid = -1;
@@ -269,9 +306,10 @@ public class StreamDownloaderPool {
         /**
          * 启动异步流下载与 MPEG-TS Codec 探测任务
          */
-        public void startDownload(final Uri primaryUri,
+        public synchronized void startDownload(final Uri primaryUri,
                                   final String rawChannelUrl,
                                   final OnStreamEventsListener listener) {
+            if (workerRunning || recycleRequested) throw new IllegalStateException("Downloader already in use or released");
             final int myToken = sessionToken.incrementAndGet();
             sessionActive = true;
             streamEof = false;
@@ -279,11 +317,27 @@ public class StreamDownloaderPool {
             parseClockAnchored = false;
             speedWindowStartMs = parseStartTimeMs;
 
-            ownerPool.getDownloadExecutor().execute(() ->
-                    runDownloadLoop(myToken, primaryUri, rawChannelUrl, listener));
+            workerRunning = true;
+            ownerPool.getDownloadExecutor().execute(() -> {
+                try {
+                    runDownloadLoop(myToken, primaryUri, rawChannelUrl, listener);
+                } finally {
+                    synchronized (this) {
+                        workerRunning = false;
+                        if (recycleRequested) ownerPool.recycle(this);
+                    }
+                }
+            });
         }
 
-        public void stopSession() {
+        private synchronized void releaseToPool() {
+            if (recycleRequested) return;
+            stopSession();
+            recycleRequested = true;
+            if (!workerRunning) ownerPool.recycle(this);
+        }
+
+        public synchronized void stopSession() {
             sessionToken.incrementAndGet();
             sessionActive = false;
             streamEof = true;
@@ -390,7 +444,10 @@ public class StreamDownloaderPool {
             try {
                 URL url = new URL(urlStr);
                 conn = (HttpURLConnection) url.openConnection();
-                activeHttpConn = conn;
+                synchronized (this) {
+                    if (!isTokenValid(token)) return false;
+                    activeHttpConn = conn;
+                }
                 conn.setConnectTimeout(2500);
                 conn.setReadTimeout(4000);
                 conn.setUseCaches(false);
@@ -406,6 +463,7 @@ public class StreamDownloaderPool {
 
                 while (isTokenValid(token)) {
                     int n = in.read(readBuf, 0, readBuf.length);
+                    if (!isTokenValid(token)) break;
                     if (n < 0) {
                         break;
                     }
@@ -452,7 +510,9 @@ public class StreamDownloaderPool {
             } catch (Exception e) {
                 return receivedAnyTs;
             } finally {
-                activeHttpConn = null;
+                synchronized (this) {
+                    if (activeHttpConn == conn) activeHttpConn = null;
+                }
                 if (in != null) {
                     try {
                         in.close();
@@ -487,7 +547,10 @@ public class StreamDownloaderPool {
             try {
                 groupAddr = InetAddress.getByName(mcastIp);
                 socket = new MulticastSocket(null);
-                activeMcastSocket = socket;
+                synchronized (this) {
+                    if (!isTokenValid(token)) return;
+                    activeMcastSocket = socket;
+                }
                 socket.setReuseAddress(true);
                 try {
                     socket.bind(new InetSocketAddress(groupAddr, mcastPort));
@@ -513,6 +576,7 @@ public class StreamDownloaderPool {
                         packet.setLength(udpBuf.length);
                         socket.receive(packet);
                     } catch (java.net.SocketTimeoutException timeoutEx) {
+                        if (!isTokenValid(token)) return;
                         // 组播接收超时处理：
                         // 1) 尚未收到首包（冷启动阶段）：IGMP 组播转发建立耗时可能超过单次超时窗口，
                         //    将首包等待宽限延长至 MCAST_FIRST_PACKET_GRACE_MS，期间周期性补发 IGMP 加入报告，
@@ -532,6 +596,7 @@ public class StreamDownloaderPool {
                         }
                         continue;
                     }
+                    if (!isTokenValid(token)) return;
                     consecutiveTimeouts = 0;
                     receivedAnyPacket = true;
                     int len = packet.getLength();
@@ -559,7 +624,9 @@ public class StreamDownloaderPool {
                     listener.onStreamError("组播流读取超时或中断: " + mcastIp + ":" + mcastPort, this);
                 }
             } finally {
-                activeMcastSocket = null;
+                synchronized (this) {
+                    if (activeMcastSocket == socket) activeMcastSocket = null;
+                }
                 if (socket != null) {
                     if (groupAddr != null) {
                         try {
@@ -631,12 +698,29 @@ public class StreamDownloaderPool {
          * 3. 写入环形缓冲区唤醒解码器读取，并按需将杜比音频包旁路给 TsHardwareAudioCompanion。
          */
         private void onAlignedTsPacket(int token, byte[] buf, int pktOffset, OnStreamEventsListener listener) {
-            int tei = (buf[pktOffset + 1] & 0x80) != 0 ? 1 : 0;
-            if (tei != 0) {
+            if (!isTokenValid(token)) return;
+            if (!firstPacketNotified) {
+                firstPacketNotified = true;
+                firstPacketAtMs = SystemClock.elapsedRealtime();
+                if (listener != null) listener.onFirstPacket(this);
+                if (!isTokenValid(token)) return;
+            }
+            // Corrupt maps must fail visibly instead of bypassing validation with a guessed codec.
+            // This deadline starts at the first TS packet, leaving cold IGMP join grace intact.
+            if (!keyframeAligned && SystemClock.elapsedRealtime() - firstPacketAtMs > STARTUP_ALIGN_TIMEOUT_MS) {
+                stopSession();
+                if (listener != null) listener.onStreamError(PlaybackFailure.FORMAT,
+                        "已收到 TS 数据，但未获得完整有效的节目表和起播帧", this);
                 return;
             }
-            boolean pusi = (buf[pktOffset + 1] & 0x40) != 0;
+            TsPacketValidator.Result result = packetValidator.inspect(buf, pktOffset);
+            if (result == TsPacketValidator.Result.DUPLICATE) return;
             int pid = ((buf[pktOffset + 1] & 0x1F) << 8) | (buf[pktOffset + 2] & 0xFF);
+            boolean selectedPid = pid == 0 || pid == pmtPid || pid == videoPid || pid == audioPid;
+            if (selectedPid && (result == TsPacketValidator.Result.DISCONTINUITY
+                    || result == TsPacketValidator.Result.CORRUPT)) resetStartupAlignmentOnPacketLoss();
+            if (result == TsPacketValidator.Result.CORRUPT) return;
+            boolean pusi = (buf[pktOffset + 1] & 0x40) != 0;
             int adaptationCtrl = (buf[pktOffset + 3] >>> 4) & 0x03;
 
             int payloadStart = pktOffset + 4;
@@ -650,21 +734,47 @@ public class StreamDownloaderPool {
             }
             int pktEnd = pktOffset + 188;
 
-            // 1. 解析并缓存 PAT 表 (PID 0x0000)
-            if (pid == 0x0000 && (adaptationCtrl & 0x01) != 0 && payloadStart < pktEnd) {
-                if (parsePatPacket(buf, payloadStart, pktEnd, pusi)) {
-                    System.arraycopy(buf, pktOffset, cachedPatPacket, 0, 188);
-                    hasPat = true;
+            // Assemble complete PSI sections, including tables split across multiple TS packets.
+            if ((adaptationCtrl & 1) != 0 && payloadStart < pktEnd) {
+                if (pid == 0) {
+                    List<TsPsiAssembler.Section> sections = patAssembler.accept(buf, pktOffset, payloadStart, pktEnd, pusi);
+                    if (patAssembler.wasCorrupt()) {
+                        resetStartupAlignmentOnPacketLoss();
+                        return;
+                    }
+                    for (TsPsiAssembler.Section section : sections) {
+                        if (parsePatSection(section.data)) {
+                            cachedPatPackets = section.packets;
+                            hasPat = true;
+                        }
+                    }
+                } else if (pmtPid > 0 && pid == pmtPid) {
+                    List<TsPsiAssembler.Section> sections = pmtAssembler.accept(buf, pktOffset, payloadStart, pktEnd, pusi);
+                    if (pmtAssembler.wasCorrupt()) {
+                        resetStartupAlignmentOnPacketLoss();
+                        return;
+                    }
+                    for (TsPsiAssembler.Section section : sections) {
+                        byte[] data = section.data;
+                        int number = ((data[3] & 255) << 8) | (data[4] & 255);
+                        if (number != programNumber) continue;
+                        if (!parsePmtSection(data)) {
+                            resetStartupAlignmentOnPacketLoss();
+                            return;
+                        }
+                        if (hasPmt && !Arrays.equals(data, currentPmtSection) && !keyframeAligned) {
+                            resetHevcStartupGate();
+                            firstVideoPts = -1L;
+                            audioAligned = false;
+                        }
+                        cachedPmtPackets = section.packets;
+                        hasPmt = true;
+                        currentPmtSection = data;
+                    }
                 }
             }
 
-            // 2. 解析并缓存 PMT 表
-            if (pmtPid > 0 && pid == pmtPid && (adaptationCtrl & 0x01) != 0 && payloadStart < pktEnd) {
-                if (parsePmtPacket(buf, payloadStart, pktEnd, pusi)) {
-                    System.arraycopy(buf, pktOffset, cachedPmtPacket, 0, 188);
-                    hasPmt = true;
-                }
-            }
+            if (!keyframeAligned && (!hasPat || !hasPmt)) return;
 
             // 旁路 TS 包给硬件伴音解码器 (仅当启用了 AC-3/E-AC-3 伴音监听且已对齐关键帧时)
             TsPacketTeeListener tee = this.audioTeeListener;
@@ -698,10 +808,10 @@ public class StreamDownloaderPool {
                         }
                         // 在缓冲区头部立即注入最新的 PAT + PMT 表，确保解码器 0 延迟识别流格式
                         if (hasPat) {
-                            writeTsPacketToRing(cachedPatPacket, 0);
+                            writeCachedPsi(cachedPatPackets);
                         }
                         if (hasPmt) {
-                            writeTsPacketToRing(cachedPmtPacket, 0);
+                            writeCachedPsi(cachedPmtPackets);
                         }
                         notifyCodecParsedIfNeeded(token, listener);
                     }
@@ -710,10 +820,10 @@ public class StreamDownloaderPool {
                     keyframeAligned = true;
                     audioAligned = true;
                     if (hasPat) {
-                        writeTsPacketToRing(cachedPatPacket, 0);
+                        writeCachedPsi(cachedPatPackets);
                     }
                     if (hasPmt) {
-                        writeTsPacketToRing(cachedPmtPacket, 0);
+                        writeCachedPsi(cachedPmtPackets);
                     }
                     notifyCodecParsedIfNeeded(token, listener);
                 } else if (!hevcStream && elapsedSinceStart >= KEYFRAME_ALIGN_MAX_WAIT_MS * 2) {
@@ -789,10 +899,10 @@ public class StreamDownloaderPool {
             audioAligned = false;
             firstVideoPts = hevcStartupFirstPts;
             if (hasPat) {
-                writeTsPacketToRing(cachedPatPacket, 0);
+                writeCachedPsi(cachedPatPackets);
             }
             if (hasPmt) {
-                writeTsPacketToRing(cachedPmtPacket, 0);
+                writeCachedPsi(cachedPmtPackets);
             }
             while (!hevcStartupPackets.isEmpty()) {
                 byte[] startupPacket = hevcStartupPackets.removeFirst();
@@ -878,116 +988,113 @@ public class StreamDownloaderPool {
             }
         }
 
-        private boolean parsePatPacket(byte[] buf, int start, int end, boolean pusi) {
-            if (!pusi) {
-                return false;
-            }
-            int pointerField = buf[start] & 0xFF;
-            int secStart = start + 1 + pointerField;
-            if (secStart + 12 > end) {
-                return false;
-            }
-            int tableId = buf[secStart] & 0xFF;
-            if (tableId != 0x00) {
-                return false;
-            }
-            int sectionLength = ((buf[secStart + 1] & 0x0F) << 8) | (buf[secStart + 2] & 0xFF);
-            int secEnd = Math.min(end, secStart + 3 + sectionLength - 4);
-            int pos = secStart + 8;
-            while (pos + 4 <= secEnd) {
-                int programNum = ((buf[pos] & 0xFF) << 8) | (buf[pos + 1] & 0xFF);
-                int pid = ((buf[pos + 2] & 0x1F) << 8) | (buf[pos + 3] & 0xFF);
-                if (programNum != 0 && pid > 0) {
-                    pmtPid = pid;
-                    return true;
+        private boolean parsePatSection(byte[] buf) {
+            int secEnd = buf.length - 4;
+            if ((secEnd - 8) % 4 != 0 || (buf[6] & 255) > (buf[7] & 255)) return false;
+            int tsId = ((buf[3] & 255) << 8) | (buf[4] & 255);
+            for (int pos = 8; pos + 4 <= secEnd; pos += 4) {
+                int number = ((buf[pos] & 255) << 8) | (buf[pos + 1] & 255);
+                int pid = ((buf[pos + 2] & 31) << 8) | (buf[pos + 3] & 255);
+                if (number == 0 || pid <= 0 || pid == 8191) continue;
+                // Keep a selected programme stable across the sections of a multi-section PAT.
+                if (hasPat && tsId == transportStreamId && (buf[6] & 255) != 0
+                        && number != programNumber) continue;
+                if (!keyframeAligned && (pmtPid != pid || programNumber != number || transportStreamId != tsId)) {
+                    hasPmt = false;
+                    cachedPmtPackets = null;
+                    pmtAssembler.reset();
+                    videoPid = audioPid = -1;
+                    parsedVideoCodec = TsCodecDescriptor.VIDEO_H264;
+                    parsedAudioCodec = TsCodecDescriptor.AUDIO_MP2;
+                    audioAligned = false;
+                    firstVideoPts = -1L;
+                    resetHevcStartupGate();
                 }
-                pos += 4;
+                pmtPid = pid;
+                programNumber = number;
+                transportStreamId = tsId;
+                return true;
             }
             return false;
         }
 
-        private boolean parsePmtPacket(byte[] buf, int start, int end, boolean pusi) {
-            if (!pusi) {
-                return false;
-            }
-            int pointerField = buf[start] & 0xFF;
-            int secStart = start + 1 + pointerField;
-            if (secStart + 12 > end) {
-                return false;
-            }
-            int tableId = buf[secStart] & 0xFF;
-            if (tableId != 0x02) {
-                return false;
-            }
-            int sectionLength = ((buf[secStart + 1] & 0x0F) << 8) | (buf[secStart + 2] & 0xFF);
-            int secEnd = Math.min(end, secStart + 3 + sectionLength - 4);
+        private boolean parsePmtSection(byte[] buf) {
+            int secStart = 0;
+            int secEnd = buf.length - 4;
+            if (buf[6] != 0 || buf[7] != 0) return false; // PMTs have a single section.
             int programInfoLen = ((buf[secStart + 10] & 0x0F) << 8) | (buf[secStart + 11] & 0xFF);
             int pos = secStart + 12 + programInfoLen;
 
             int foundVideoPid = -1;
             int foundAudioPid = -1;
+            int nextVideoType = 0;
+            int nextAudioType = 0;
+            String nextVideoCodec = "";
+            String nextAudioCodec = "";
 
             while (pos + 5 <= secEnd) {
                 int streamType = buf[pos] & 0xFF;
                 int elemPid = ((buf[pos + 1] & 0x1F) << 8) | (buf[pos + 2] & 0xFF);
                 int esInfoLen = ((buf[pos + 3] & 0x0F) << 8) | (buf[pos + 4] & 0xFF);
+                if (pos + 5 + esInfoLen > secEnd) return false;
                 int descStart = pos + 5;
                 int descEnd = Math.min(secEnd, descStart + esInfoLen);
 
                 // 识别视频流类型
                 if (streamType == 0x1B) {
                     foundVideoPid = elemPid;
-                    videoStreamType = streamType;
-                    parsedVideoCodec = TsCodecDescriptor.VIDEO_H264;
+                    nextVideoType = streamType;
+                    nextVideoCodec = TsCodecDescriptor.VIDEO_H264;
                 } else if (streamType == 0x24) {
                     foundVideoPid = elemPid;
-                    videoStreamType = streamType;
-                    parsedVideoCodec = TsCodecDescriptor.VIDEO_HEVC;
+                    nextVideoType = streamType;
+                    nextVideoCodec = TsCodecDescriptor.VIDEO_HEVC;
                 } else if (streamType == 0x02 && foundVideoPid < 0) {
                     foundVideoPid = elemPid;
-                    videoStreamType = streamType;
-                    parsedVideoCodec = TsCodecDescriptor.VIDEO_MPEG2;
+                    nextVideoType = streamType;
+                    nextVideoCodec = TsCodecDescriptor.VIDEO_MPEG2;
                 }
 
                 // 识别音频流类型
                 if (foundAudioPid < 0) {
                     if (streamType == 0x03 || streamType == 0x04) {
                         foundAudioPid = elemPid;
-                        audioStreamType = streamType;
-                        parsedAudioCodec = TsCodecDescriptor.AUDIO_MP2;
+                        nextAudioType = streamType;
+                        nextAudioCodec = TsCodecDescriptor.AUDIO_MP2;
                     } else if (streamType == 0x0F || streamType == 0x11) {
                         foundAudioPid = elemPid;
-                        audioStreamType = streamType;
-                        parsedAudioCodec = TsCodecDescriptor.AUDIO_AAC;
+                        nextAudioType = streamType;
+                        nextAudioCodec = TsCodecDescriptor.AUDIO_AAC;
                     } else if (streamType == 0x81) {
                         foundAudioPid = elemPid;
-                        audioStreamType = streamType;
-                        parsedAudioCodec = TsCodecDescriptor.AUDIO_AC3;
+                        nextAudioType = streamType;
+                        nextAudioCodec = TsCodecDescriptor.AUDIO_AC3;
                     } else if (streamType == 0x87) {
                         foundAudioPid = elemPid;
-                        audioStreamType = streamType;
-                        parsedAudioCodec = TsCodecDescriptor.AUDIO_EAC3;
+                        nextAudioType = streamType;
+                        nextAudioCodec = TsCodecDescriptor.AUDIO_EAC3;
                     } else if (streamType == 0x06) {
                         for (int d = descStart; d + 2 <= descEnd; ) {
                             int tag = buf[d] & 0xFF;
                             int dLen = buf[d + 1] & 0xFF;
+                            if (d + 2 + dLen > descEnd) return false;
                             if (tag == 0x6A) {
                                 foundAudioPid = elemPid;
-                                audioStreamType = 0x81;
-                                parsedAudioCodec = TsCodecDescriptor.AUDIO_AC3;
+                                nextAudioType = 0x81;
+                                nextAudioCodec = TsCodecDescriptor.AUDIO_AC3;
                                 break;
                             } else if (tag == 0x7A) {
                                 foundAudioPid = elemPid;
-                                audioStreamType = 0x87;
-                                parsedAudioCodec = TsCodecDescriptor.AUDIO_EAC3;
+                                nextAudioType = 0x87;
+                                nextAudioCodec = TsCodecDescriptor.AUDIO_EAC3;
                                 break;
                             }
                             d += 2 + dLen;
                         }
-                        if (foundAudioPid < 0 && TsCodecDescriptor.VIDEO_HEVC.equals(parsedVideoCodec)) {
+                        if (foundAudioPid < 0 && TsCodecDescriptor.VIDEO_HEVC.equals(nextVideoCodec)) {
                             foundAudioPid = elemPid;
-                            audioStreamType = 0x87;
-                            parsedAudioCodec = TsCodecDescriptor.AUDIO_EAC3;
+                            nextAudioType = 0x87;
+                            nextAudioCodec = TsCodecDescriptor.AUDIO_EAC3;
                         }
                     }
                 }
@@ -995,13 +1102,14 @@ public class StreamDownloaderPool {
                 pos += 5 + esInfoLen;
             }
 
-            if (foundVideoPid > 0) {
-                videoPid = foundVideoPid;
-            }
-            if (foundAudioPid > 0) {
-                audioPid = foundAudioPid;
-            }
-            return videoPid > 0 || audioPid > 0;
+            if (pos != secEnd || (foundVideoPid <= 0 && foundAudioPid <= 0)) return false;
+            videoPid = foundVideoPid;
+            audioPid = foundAudioPid;
+            videoStreamType = nextVideoType;
+            audioStreamType = nextAudioType;
+            parsedVideoCodec = nextVideoCodec;
+            parsedAudioCodec = nextAudioCodec;
+            return true;
         }
 
         /**
@@ -1066,6 +1174,13 @@ public class StreamDownloaderPool {
         private boolean isPtsAtOrAfter(long pts, long thresholdPts) {
             long diff = (pts - thresholdPts) & 0x1FFFFFFFFL;
             return diff < 0x100000000L;
+        }
+
+        private void writeCachedPsi(byte[] packets) {
+            if (packets == null) return;
+            for (int offset = 0; offset < packets.length; offset += 188) {
+                writeTsPacketToRing(packets, offset);
+            }
         }
 
         private void writeTsPacketToRing(byte[] src, int offset) {

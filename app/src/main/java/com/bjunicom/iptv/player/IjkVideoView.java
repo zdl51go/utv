@@ -110,6 +110,7 @@ public class IjkVideoView extends FrameLayout {
     // 或组播加入初期丢包损坏首 IDR 时配置失败 (err -1010/-22)，重建干净实例再等一个
     // 完好 IDR 即可恢复硬解；重试耗尽后才一次性回退系统播放器，任何切台都重新优先 IJK
     private int mHevcFreshRetryCount = 0;
+    private boolean mExpandedIjkProbeWindow;
     private static final int MAX_HEVC_FRESH_RETRIES = 2;
     private static final long HEVC_FALLBACK_DELAY_MS = 1800L;
 
@@ -251,9 +252,13 @@ public class IjkVideoView extends FrameLayout {
     }
 
     public void setVideoURI(Uri uri, Map<String, String> headers) {
+        // Invalidate callbacks even when openVideo must wait for a new Surface.
+        mPlaybackSessionToken.incrementAndGet();
         mUri = uri;
         mHeaders = headers;
+        mOpenOnSurfaceCreated = true;
         mHevcFreshRetryCount = 0;
+        mExpandedIjkProbeWindow = false;
         mPlaybackMetrics = new PlaybackMetrics();
         mLastFailure = PlaybackFailure.UNKNOWN;
         openVideo();
@@ -275,9 +280,11 @@ public class IjkVideoView extends FrameLayout {
         if (mUri == null || mSurfaceHolder == null) {
             return;
         }
+        mOpenOnSurfaceCreated = false;
         release(false);
 
         final long sessionToken = mPlaybackSessionToken.incrementAndGet();
+        final PlaybackMetrics requestMetrics = mPlaybackMetrics;
 
         AudioManager am = (AudioManager) mAppContext.getSystemService(Context.AUDIO_SERVICE);
         if (am != null) {
@@ -306,8 +313,18 @@ public class IjkVideoView extends FrameLayout {
 
                 downloader.startDownload(playbackUri, mRawChannelUrl, new StreamDownloaderPool.OnStreamEventsListener() {
                     @Override
+                    public void onFirstPacket(StreamDownloaderPool.PooledStreamDownloader activeDl) {
+                        if (sessionToken == mPlaybackSessionToken.get() && requestMetrics != null) {
+                            requestMetrics.onInfo(PlaybackMetrics.INFO_FIRST_PACKET);
+                        }
+                    }
+
+                    @Override
                     public void onCodecParsed(final TsCodecDescriptor descriptor,
                                               final StreamDownloaderPool.PooledStreamDownloader activeDl) {
+                        if (sessionToken == mPlaybackSessionToken.get() && requestMetrics != null) {
+                            requestMetrics.onInfo(PlaybackMetrics.INFO_STREAM_INFO);
+                        }
                         post(() -> {
                             if (sessionToken != mPlaybackSessionToken.get()) {
                                 return;
@@ -319,6 +336,12 @@ public class IjkVideoView extends FrameLayout {
                     @Override
                     public void onStreamError(final String reason,
                                               final StreamDownloaderPool.PooledStreamDownloader activeDl) {
+                        onStreamError(PlaybackFailure.UNKNOWN, reason, activeDl);
+                    }
+
+                    @Override
+                    public void onStreamError(final PlaybackFailure failure, final String reason,
+                                              final StreamDownloaderPool.PooledStreamDownloader activeDl) {
                         post(() -> {
                             if (sessionToken != mPlaybackSessionToken.get()) {
                                 return;
@@ -326,7 +349,8 @@ public class IjkVideoView extends FrameLayout {
                             Log.w(TAG, "StreamDownloader error for " + mUri + ": " + reason);
                             mCurrentState = STATE_ERROR;
                             mTargetState = STATE_ERROR;
-                            mErrorListener.onError(mMediaPlayer, MediaPlayer.MEDIA_ERROR_UNKNOWN, 0);
+                            mErrorListener.onError(mMediaPlayer, MediaPlayer.MEDIA_ERROR_UNKNOWN,
+                                    failure == PlaybackFailure.FORMAT ? IMediaPlayer.MEDIA_ERROR_MALFORMED : 0);
                         });
                     }
                 });
@@ -372,6 +396,11 @@ public class IjkVideoView extends FrameLayout {
             mActiveCodecDescriptor = descriptor;
             mPooledIjkDecoder = CodecDecoderPool.getInstance().acquireIjkDecoder(descriptor, mSettings);
             IjkMediaPlayer ijkPlayer = mPooledIjkDecoder.player;
+            if (mExpandedIjkProbeWindow) {
+                IjkStartupPolicy probe = IjkStartupPolicy.forStream(descriptor, true);
+                ijkPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "probesize", probe.probeSizeBytes);
+                ijkPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzeduration", probe.analyzeDurationUs);
+            }
 
             if (mSettings.getRenderViewType() == RENDER_TEXTURE_VIEW) {
                 mMediaPlayer = new TextureMediaPlayer(ijkPlayer);
@@ -422,11 +451,24 @@ public class IjkVideoView extends FrameLayout {
         if (mp == null) {
             return;
         }
-        mp.setOnPreparedListener(mPreparedListener);
-        mp.setOnVideoSizeChangedListener(mSizeChangedListener);
-        mp.setOnCompletionListener(mCompletionListener);
-        mp.setOnErrorListener(mErrorListener);
-        mp.setOnInfoListener(mInfoListener);
+        final long token = mPlaybackSessionToken.get();
+        mp.setOnPreparedListener(player -> {
+            if (isCurrentPlayer(mp, token)) mPreparedListener.onPrepared(player);
+        });
+        mp.setOnVideoSizeChangedListener((player, width, height, sarNum, sarDen) -> {
+            if (isCurrentPlayer(mp, token)) mSizeChangedListener.onVideoSizeChanged(player, width, height, sarNum, sarDen);
+        });
+        mp.setOnCompletionListener(player -> {
+            if (isCurrentPlayer(mp, token)) mCompletionListener.onCompletion(player);
+        });
+        mp.setOnErrorListener((player, what, extra) ->
+                !isCurrentPlayer(mp, token) || mErrorListener.onError(player, what, extra));
+        mp.setOnInfoListener((player, what, extra) ->
+                !isCurrentPlayer(mp, token) || mInfoListener.onInfo(player, what, extra));
+    }
+
+    private boolean isCurrentPlayer(IMediaPlayer player, long token) {
+        return player == mMediaPlayer && token == mPlaybackSessionToken.get();
     }
 
     /**
@@ -528,6 +570,7 @@ public class IjkVideoView extends FrameLayout {
         mCurrentState = STATE_IDLE;
         if (cleartargetstate) {
             mTargetState = STATE_IDLE;
+            mOpenOnSurfaceCreated = false;
         }
         AudioManager am = (AudioManager) mAppContext.getSystemService(Context.AUDIO_SERVICE);
         if (am != null) {
@@ -567,6 +610,10 @@ public class IjkVideoView extends FrameLayout {
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    public boolean isPlaybackRequested() {
+        return mTargetState == STATE_PLAYING;
     }
 
     private boolean isInPlaybackState() {
@@ -613,6 +660,27 @@ public class IjkVideoView extends FrameLayout {
 
     public long getFirstFrameCostMs() {
         return mPlaybackMetrics != null ? mPlaybackMetrics.getFirstVideoMs() : -1;
+    }
+
+    public long getFirstAudioCostMs() {
+        return mPlaybackMetrics != null ? mPlaybackMetrics.getFirstAudioMs() : -1;
+    }
+
+    public boolean isAudioOnlyStream() {
+        if (mActiveCodecDescriptor != null && mActiveCodecDescriptor.videoPid > 0) return false;
+        try {
+            ITrackInfo[] tracks = mMediaPlayer != null ? mMediaPlayer.getTrackInfo() : null;
+            boolean audio = false;
+            if (tracks == null) return false;
+            for (ITrackInfo track : tracks) {
+                if (track == null) continue;
+                if (track.getTrackType() == ITrackInfo.MEDIA_TRACK_TYPE_VIDEO) return false;
+                if (track.getTrackType() == ITrackInfo.MEDIA_TRACK_TYPE_AUDIO) audio = true;
+            }
+            return audio;
+        } catch (RuntimeException error) {
+            return false;
+        }
     }
 
     public String getStartupMetricsSummary() {
@@ -889,6 +957,11 @@ public class IjkVideoView extends FrameLayout {
     private final IMediaPlayer.OnPreparedListener mPreparedListener = new IMediaPlayer.OnPreparedListener() {
         @Override
         public void onPrepared(IMediaPlayer mp) {
+            boolean multicastIjk = getEffectivePlayerType() == IptvSettings.PLAYER_IJK
+                    && IjkStartupPolicy.isMulticast(mRawChannelUrl, mUri);
+            if (multicastIjk && !validateIjkPreparation(mp)) {
+                return;
+            }
             mPrepareEndTime = System.currentTimeMillis();
             mCurrentState = STATE_PREPARED;
             if (mPlaybackMetrics != null) {
@@ -922,7 +995,8 @@ public class IjkVideoView extends FrameLayout {
                     mRenderView.setVideoSampleAspectRatio(mVideoSarNum, mVideoSarDen);
                     if (!mRenderView.shouldWaitForResize()
                             || (mSurfaceWidth == mVideoWidth && mSurfaceHeight == mVideoHeight)
-                            || mSettings.getPlayerType() != IptvSettings.PLAYER_IJK) {
+                            || mSettings.getPlayerType() != IptvSettings.PLAYER_IJK
+                            || multicastIjk) {
                         if (mTargetState == STATE_PLAYING) {
                             start();
                         }
@@ -935,6 +1009,44 @@ public class IjkVideoView extends FrameLayout {
             }
         }
     };
+
+    protected Bundle readIjkMediaMeta(IMediaPlayer player) {
+        return ((IjkMediaPlayer) unwrapIjkMediaPlayer()).getMediaMeta();
+    }
+
+    private boolean validateIjkPreparation(IMediaPlayer player) {
+        String issue;
+        try {
+            issue = IjkStartupPolicy.videoParametersIssue(readIjkMediaMeta(player),
+                    mActiveCodecDescriptor != null && mActiveCodecDescriptor.videoPid > 0);
+        } catch (RuntimeException error) {
+            Log.w(TAG, "Unable to read Ijk startup metadata", error);
+            issue = "unavailable stream metadata";
+        }
+        if (issue == null) return true;
+        Log.w(TAG, "Incomplete Ijk video parameters: " + issue
+                + ", expandedProbe=" + mExpandedIjkProbeWindow);
+        if (mExpandedIjkProbeWindow) {
+            release(false, true);
+            mErrorListener.onError(player, IMediaPlayer.MEDIA_ERROR_UNKNOWN, IMediaPlayer.MEDIA_ERROR_MALFORMED);
+            return false;
+        }
+        mExpandedIjkProbeWindow = true;
+        TsCodecDescriptor descriptor = mActiveCodecDescriptor;
+        release(false, true);
+        if (descriptor != null) {
+            CodecDecoderPool.getInstance().drainIjkDecodersForProfile(descriptor, mSettings);
+        }
+        mCurrentState = STATE_PREPARING;
+        final long token = mPlaybackSessionToken.get();
+        // Use the existing Surface recovery path; preserve pause/play intent and HEVC retry count.
+        if (!recreateRenderViewForRecovery(true)) {
+            postDelayed(() -> {
+                if (token == mPlaybackSessionToken.get()) openVideo();
+            }, 800);
+        }
+        return false;
+    }
 
     /**
      * 检查音频轨道是否需要挂载池化硬件伴音解码器：
@@ -1051,7 +1163,6 @@ public class IjkVideoView extends FrameLayout {
         release(false, true);
         // 池中可能还有之前正常回收的同 Profile 实例，一并清空，确保重试用的是全新实例
         CodecDecoderPool.getInstance().drainIjkDecodersForProfile(descriptorBeforeTeardown, mSettings);
-        mTargetState = STATE_PLAYING;
         final long tokenAfterTeardown = mPlaybackSessionToken.get();
         if (!recreateRenderViewForRecovery(true)) {
             postDelayed(() -> {

@@ -17,6 +17,7 @@ import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.FutureTask;
@@ -45,15 +46,15 @@ public class CodecDecoderPool {
 
     private static volatile CodecDecoderPool instance;
 
-    private final Map<String, Queue<PooledIjkDecoder>> ijkDecoderPools = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Queue<PooledIjkDecoder>> ijkDecoderPools = new ConcurrentHashMap<>();
     // Decoder teardown is asynchronous. Keep release futures so a new decoder
     // is not configured while the previous OMX surface/resource is still live.
-    private final Map<String, Queue<FutureTask<Void>>> pendingIjkReleases = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Queue<FutureTask<Void>>> pendingIjkReleases = new ConcurrentHashMap<>();
     private static final long IJK_RELEASE_GRACE_MS = 750L;
     // Recovery now recreates the SurfaceView, so the old native window only
     // needs a short OMX teardown grace instead of the previous 3.5 seconds.
     private static final long HEVC_RELEASE_GRACE_MS = 1500L;
-    private final Map<String, Queue<PooledHwAudioDecoder>> hwAudioPools = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Queue<PooledHwAudioDecoder>> hwAudioPools = new ConcurrentHashMap<>();
     private final ExecutorService lifecycleExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "CodecDecoderPoolRecycler");
         t.setDaemon(true);
@@ -314,17 +315,25 @@ public class CodecDecoderPool {
         }) {
             @Override
             protected void done() {
-                Queue<FutureTask<Void>> pending = pendingIjkReleases.get(profileKey);
-                if (pending != null) {
-                    pending.remove(this);
-                    if (pending.isEmpty()) {
-                        pendingIjkReleases.remove(profileKey, pending);
+                synchronized (pendingIjkReleases) {
+                    Queue<FutureTask<Void>> pending = pendingIjkReleases.get(profileKey);
+                    if (pending != null) {
+                        pending.remove(this);
+                        if (pending.isEmpty()) pendingIjkReleases.remove(profileKey, pending);
                     }
                 }
             }
         };
-        pendingIjkReleases.computeIfAbsent(profileKey, key -> new ConcurrentLinkedQueue<>())
-                .offer(releaseTask);
+        // Java 8 Map.computeIfAbsent is unavailable on Android 5/6. Protect both
+        // enqueue and removal so a completed release cannot detach a newly queued task.
+        synchronized (pendingIjkReleases) {
+            Queue<FutureTask<Void>> pending = pendingIjkReleases.get(profileKey);
+            if (pending == null) {
+                pending = new ConcurrentLinkedQueue<>();
+                pendingIjkReleases.put(profileKey, pending);
+            }
+            pending.offer(releaseTask);
+        }
         lifecycleExecutor.execute(releaseTask);
     }
 
@@ -445,7 +454,8 @@ public class CodecDecoderPool {
         ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "overlay-format", IjkMediaPlayer.SDL_FCC_RV32);
         ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "sync-av-start", 1);
         ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "framedrop", 2);
-        ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "start-on-prepared", 1);
+        // Java validates the probe result and the current play/pause target before starting.
+        ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "start-on-prepared", 0);
         ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "fast", 1);
         ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "infbuf", 1);
         ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "packet-buffering", 0);
@@ -456,15 +466,9 @@ public class CodecDecoderPool {
         // HEVC 4K 例外：Wi-Fi 组播加入初期的丢包常损坏首个 IDR，探针太小会探测不到视频参数
         // (unspecified size) → MTK 硬解以 0x0 尺寸配置失败 (err -1010) 或被 ijk 直接跳过。
         // 加大 HEVC 的探测窗口让 FFmpeg 等到下一个完整 IDR，代价仅是 4K 起播多等约 1 秒。
-        boolean preAligned = desc != null && desc.keyframeAligned;
-        long probeSize = preAligned ? (96 * 1024L) : (256 * 1024L);
-        long analyzeUs = preAligned ? 120000L : 400000L;
-        if (isHevcStream) {
-            probeSize = Math.max(probeSize, 1536 * 1024L);
-            analyzeUs = Math.max(analyzeUs, 1500000L);
-        }
-        ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "probesize", probeSize);
-        ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzeduration", analyzeUs);
+        IjkStartupPolicy probe = IjkStartupPolicy.forStream(desc, false);
+        ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "probesize", probe.probeSizeBytes);
+        ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzeduration", probe.analyzeDurationUs);
         ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "fpsprobesize", 0);
         ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "flush_packets", 1L);
         ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "fflags", "nobuffer+fastseek+discardcorrupt");

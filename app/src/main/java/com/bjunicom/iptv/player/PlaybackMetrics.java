@@ -3,37 +3,71 @@ package com.bjunicom.iptv.player;
 import android.os.SystemClock;
 import android.util.Log;
 
-import tv.danmaku.ijk.media.player.IMediaPlayer;
-
-/** Monotonic startup timing for one channel request. */
+/** Monotonic startup timestamps belonging to one channel request, including recovery attempts. */
 public final class PlaybackMetrics {
-    private static final String TAG = "PlaybackMetrics";
-    private final long startedAtMs = SystemClock.elapsedRealtime();
+    public static final int INFO_FIRST_PACKET = 20001;
+    public static final int INFO_TRANSPORT_FALLBACK = 20002;
+    public static final int INFO_STREAM_INFO = 20003;
+    public static final int INFO_VIDEO_DECODER_READY = 20004;
+    public static final int INFO_AUDIO_RENDERING_START = 20005;
+
+    private final long startedAtMs;
+    private long firstPacketMs = -1;
+    private long streamInfoMs = -1;
+    private long decoderReadyMs = -1;
     private long preparedMs = -1;
     private long firstVideoMs = -1;
-    private long firstPacketMs = -1;
+    private long firstAudioMs = -1;
 
-    public void prepared() {
-        if (preparedMs < 0) {
-            preparedMs = elapsed();
+    public PlaybackMetrics() {
+        startedAtMs = SystemClock.elapsedRealtime();
+    }
+
+    public synchronized void prepared() {
+        if (preparedMs < 0) preparedMs = elapsed();
+    }
+
+    public synchronized void onInfo(int info) {
+        switch (info) {
+            case INFO_FIRST_PACKET:
+                if (firstPacketMs < 0) firstPacketMs = elapsed();
+                break;
+            case INFO_STREAM_INFO:
+            case tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_FIND_STREAM_INFO:
+                if (streamInfoMs < 0) streamInfoMs = elapsed();
+                break;
+            case INFO_VIDEO_DECODER_READY:
+            case tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_COMPONENT_OPEN:
+                if (decoderReadyMs < 0) decoderReadyMs = elapsed();
+                break;
+            case tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START:
+                if (firstVideoMs < 0) {
+                    firstVideoMs = elapsed();
+                    Log.i("PlaybackMetrics", summary());
+                }
+                break;
+            case INFO_AUDIO_RENDERING_START:
+            case tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_AUDIO_RENDERING_START:
+                if (firstAudioMs < 0) firstAudioMs = elapsed();
+                break;
+            default:
+                break;
         }
     }
 
-    public void onInfo(int what) {
-        if (what == IMediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START && firstVideoMs < 0) {
-            firstVideoMs = elapsed();
-            Log.i(TAG, summary());
-        }
-    }
-
-    public long getFirstVideoMs() {
+    public synchronized long getFirstVideoMs() {
         return firstVideoMs;
     }
 
-    public String summary() {
+    public synchronized long getFirstAudioMs() {
+        return firstAudioMs;
+    }
+
+    public synchronized String summary() {
         return "startup firstPacketMs=" + firstPacketMs
-                + " preparedMs=" + preparedMs
-                + " firstVideoMs=" + firstVideoMs;
+                + " streamInfoMs=" + streamInfoMs + " decoderReadyMs=" + decoderReadyMs
+                + " preparedMs=" + preparedMs + " firstVideoMs=" + firstVideoMs
+                + " firstAudioMs=" + firstAudioMs;
     }
 
     private long elapsed() {
